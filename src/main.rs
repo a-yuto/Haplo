@@ -1,3 +1,6 @@
+// Haplo の CLI エントリポイントとエラー統合。
+// run() 関数がテスト可能な純粋関数として字句解析→構文解析→評価のパイプラインを担い、
+// main() はファイル読み込みと標準出力への表示のみを担当する。
 mod ast;
 mod interpreter;
 mod lexer;
@@ -6,6 +9,10 @@ mod value;
 
 use value::Value;
 
+// パイプライン全体のエラーを一つの型に統合する。
+// From トレイトを実装することで ? 演算子でエラーを自動変換できる。
+// 代替: anyhow や thiserror クレートを使う方法があるが、
+// 外部依存を最小にするために手書きを選んだ。P0 のエラー種類は少ないので手間は小さい。
 #[derive(Debug)]
 enum HaploError {
     Lex(lexer::LexError),
@@ -46,6 +53,10 @@ impl From<std::io::Error> for HaploError {
     }
 }
 
+// ソース文字列を受け取り、評価結果の Value を返す純粋な関数。
+// ファイル読み込みや標準出力を行わないため、テストから直接呼べる。
+// パイプラインは: lex() → parse() → eval_program() の3段。
+// ? 演算子で各段のエラーを HaploError に変換しながら伝播させる。
 pub fn run(source: &str) -> Result<Value, HaploError> {
     let tokens = lexer::lex(source)?;
     let program = parser::parse(&tokens)?;
@@ -53,6 +64,10 @@ pub fn run(source: &str) -> Result<Value, HaploError> {
     Ok(val)
 }
 
+// 実行ファイルのエントリポイント。
+// コマンドライン引数からファイルパスを取得し、読み込んで run() に渡す。
+// 成功時は結果を println! で表示（IO はここだけで行う）。
+// エラー時は eprintln! で標準エラーに出力し、終了コード 1 で終了する。
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = if args.len() >= 2 {

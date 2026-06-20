@@ -1,4 +1,16 @@
-/// Haplo パーサ（再帰下降）
+// Haplo の再帰下降パーサ。
+// Token の列（lexer の出力）を受け取り、Program（AST）に変換する。
+//
+// 設計の選択: 手書き再帰下降 vs パーサジェネレータ（nom, pest, lalrpop）
+// 手書きを選んだ理由:
+//   - エラーメッセージを自由にカスタマイズできる（「〇〇の後に = が必要です」等）
+//   - Haplo の文法は小さく、パーサジェネレータの習得コストが見合わない
+//   - 再帰下降はコードの流れが文法規則と1対1で対応するため読みやすい
+//
+// 演算子優先順位の実装: Pratt パーサ vs 関数の呼び出しチェーン
+// 呼び出しチェーン（parse_additive が parse_matmul を呼ぶ等）を選んだ理由:
+//   - Pratt パーサは汎用的だが、演算子が固定・少数の場合はオーバーキル
+//   - チェーン方式はそれぞれの優先順位レベルが独立した関数として見える
 use crate::ast::*;
 use crate::lexer::{Span, Token, TokenKind};
 
@@ -33,6 +45,11 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+// パーサの状態を保持する構造体。
+// tokens: lexer が返したトークン列への参照（所有権は持たない）
+// pos:    現在読んでいる位置。advance() で進む。
+// Eof トークンの後に pos が進まないよう advance() 内でガードしている。
+// これにより EOF をどこで検出してもパニックしない。
 pub struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
@@ -72,6 +89,10 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // Newline トークンを読み飛ばすヘルパー。
+    // キーワード（let, in, then, else）や `=` の後に呼ぶことで、
+    // ユーザが式を次の行に書いても正しくパースできる。
+    // 例: "let x =\n  3 in x" の \n をここで吸収する。
     fn eat_newlines(&mut self) {
         while matches!(self.peek(), TokenKind::Newline) {
             self.advance();
@@ -99,6 +120,11 @@ impl<'a> Parser<'a> {
         Ok(items)
     }
 
+    // 型注釈（name : Type）と束縛（name params* = expr）を区別してパースする。
+    // 識別子の後のトークンで判定:
+    //   : → 型注釈
+    //   識別子 or = → 束縛（識別子はパラメータ名）
+    // この2種類だけが先頭にくるため、それ以外はエラー。
     fn parse_top_level(&mut self) -> Result<TopLevel, ParseError> {
         // `name : Type` または `name param* = expr`
         let name = match self.peek().clone() {
@@ -155,6 +181,10 @@ impl<'a> Parser<'a> {
         match self.peek().clone() {
             TokenKind::Ident(name) => {
                 self.advance();
+                // "Tensor[m, n]" のような次元付きテンソル型を特別扱いでパースする。
+                // 次元には整数リテラル（固定サイズ）または識別子（次元変数）を許可する。
+                // P0 ではどちらも None として格納し、型検査では使わない。
+                // P2 以降の静的 shape 検査で活用する予定。
                 if name == "Tensor" && matches!(self.peek(), TokenKind::LBrack) {
                     self.advance(); // consume `[`
                     let mut dims = Vec::new();
@@ -317,6 +347,10 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    // ^ 演算子を右結合でパースする。
+    // 通常の左再帰ループではなく、再帰呼び出しで実装する。
+    // "2 ^ 3 ^ 4" → Pow(2, Pow(3, 4)) となり、数学の慣習に合う。
+    // 代替の左結合（Pow(Pow(2,3), 4)）は数学的に間違いなので採用しない。
     /// `^` — 右結合
     fn parse_power(&mut self) -> Result<Expr, ParseError> {
         let base = self.parse_unary()?;
@@ -345,6 +379,10 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // 空白による関数適用をパースする（最高優先順位）。
+    // アトムを1つパースした後、next_starts_atom が真の間はアトムを読み続け、
+    // App(App(func, arg1), arg2) のように左再帰でネストする。
+    // 例: "f a b" → App(App(Var"f", Var"a"), Var"b")
     /// 関数適用（空白区切り、左結合）
     fn parse_application(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_atom()?;
@@ -359,6 +397,13 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    // 次のトークンが「関数の引数として読める式の先頭か」を判定する。
+    // `-` をここに含めない理由:
+    //   "10 - 3" を parse_application が "App(10, -3)" と解釈するのを防ぐため。
+    //   `-` を含めると、10 の後に `-3`（単項マイナス付きの 3）が来たと解釈され、
+    //   `10` を関数として `-3` に適用しようとしてしまう。
+    // 負数を関数の引数として渡す場合は括弧を使う: `f (-3)`
+    // これは Elm や Haskell でも同様の制約がある。
     fn next_starts_atom(&self) -> bool {
         // Minus は含めない: `10 - 3` を App(10, -3) ではなく BinOp(Sub, 10, 3) にする。
         // 負数を引数に渡す場合は括弧を使う: `f (-3)`
@@ -481,6 +526,11 @@ impl<'a> Parser<'a> {
         })
     }
 
+    // テンソルリテラル [e1, e2; e3, e4] をパースする。
+    // 要素式を parse_expr で評価し、カンマで区切って現在行に追加、
+    // セミコロンで新しい行を開始、] で終了する。
+    // 各要素は任意の式（変数・計算式を含む）にできる。
+    // 例: [x + 1, y * 2] のような動的な値も有効。
     fn parse_tensor_lit(&mut self) -> Result<Expr, ParseError> {
         self.expect(&TokenKind::LBrack, "[")?;
         self.eat_newlines();
