@@ -190,82 +190,106 @@ fn backward_impl(tape: &Tape, output: usize) -> Vec<ArrayD<f64>> {
     // 出力ノードの随伴を 1 で種付け。
     grads[output] = ArrayD::ones(tape.nodes[output].value.raw_dim());
 
-    // ノードは生成順（親→子）に積まれているので、逆順に辿れば子→親の順になる。
+    // ノードは生成順（親 → 子）に積まれているので、index を逆順に辿れば
+    // 必ず「子を先に、親を後に」処理できる（トポロジカル順序が自明に得られる）。
+    //
+    // 各反復の不変条件: ループが i に来た時点で grads[i] には、出力からノード i までの
+    // 随伴（adjoint）∂output/∂node_i が完成して入っている。これを使って連鎖律
+    //   ∂output/∂parent = ∂output/∂node_i · ∂node_i/∂parent（= local_grad）
+    // を計算し、親ノードの随伴に「加算」していく（同じ親へ複数経路から流れ込むため）。
+    // g = grads[i] は現ノードの随伴で、各アームの「local_grad」に掛ける係数になる。
     for i in (0..n).rev() {
         let g = grads[i].clone();
         let nodes = &tape.nodes;
         match nodes[i].op {
+            // 葉（入力変数・定数）。親を持たないので随伴を配る先がない。
+            // grads[leaf] は子側からの加算で既に埋まっており、それが最終的な勾配になる。
             Op::Leaf => {}
+            // c = a + b。∂c/∂a = ∂c/∂b = 1 なので、随伴 g をそのまま両親へ流す。
+            // ブロードキャストしていた場合は reduce_to が余分な軸を畳んで形を合わせる。
             Op::Add(a, b) => {
                 acc(&mut grads, a, reduce_to(&g, &nodes[a].value));
                 acc(&mut grads, b, reduce_to(&g, &nodes[b].value));
             }
+            // c = a - b。∂c/∂a = +1、∂c/∂b = -1。b 側だけ符号を反転して流す。
             Op::Sub(a, b) => {
                 acc(&mut grads, a, reduce_to(&g, &nodes[a].value));
                 acc(&mut grads, b, reduce_to(&g.mapv(|v| -v), &nodes[b].value));
             }
+            // c = a * b（要素ごと）。∂c/∂a = b、∂c/∂b = a。
+            // 「相手の値」を随伴に掛けて流すのが積の微分（product rule）の本質。
             Op::Mul(a, b) => {
-                let ga = ew(&g, &nodes[b].value, |x, y| x * y);
-                let gb = ew(&g, &nodes[a].value, |x, y| x * y);
+                let ga = ew(&g, &nodes[b].value, |x, y| x * y); // g * b
+                let gb = ew(&g, &nodes[a].value, |x, y| x * y); // g * a
                 acc(&mut grads, a, reduce_to(&ga, &nodes[a].value));
                 acc(&mut grads, b, reduce_to(&gb, &nodes[b].value));
             }
+            // c = a / b。∂c/∂a = 1/b、∂c/∂b = -a/b^2（商の微分）。
             Op::Div(a, b) => {
                 let av = &nodes[a].value;
                 let bv = &nodes[b].value;
-                // d/da = g / b
+                // ∂output/∂a = g * (1/b)
                 let ga = ew(&g, bv, |x, y| x / y);
-                // d/db = g * (-a / b^2)
+                // ∂output/∂b = g * (-a / b^2)
                 let local = ew(av, bv, |x, y| -x / (y * y));
                 let gb = ew(&g, &local, |x, y| x * y);
                 acc(&mut grads, a, reduce_to(&ga, av));
                 acc(&mut grads, b, reduce_to(&gb, bv));
             }
+            // c = a^b。底 a と指数 b の両方で偏微分する（一般のべき乗）。
+            //   ∂c/∂a = b * a^(b-1)
+            //   ∂c/∂b = a^b * ln(a) = c * ln(a)
+            // 実用上は指数が定数（例 ^2）なので b 側の勾配は捨てられるが、
+            // 一般性のため両方計算しておく（定数 leaf の随伴は誰も読まないので無害）。
             Op::Pow(a, b) => {
                 let av = &nodes[a].value;
                 let bv = &nodes[b].value;
-                let cv = &nodes[i].value;
-                // d/da = g * b * a^(b-1)
+                let cv = &nodes[i].value; // c = a^b（forward 済みの値を再利用）
                 let local_a = ew(av, bv, |x, y| y * x.powf(y - 1.0));
                 let da = ew(&g, &local_a, |x, y| x * y);
-                // d/db = g * c * ln(a)。指数が定数の場合この勾配は読まれない。
+                // a<=0 では ln(a) が NaN になるため 0 でガード（その経路の勾配は使われない）。
                 let local_b = ew(cv, av, |c, a| if a > 0.0 { c * a.ln() } else { 0.0 });
                 let db = ew(&g, &local_b, |x, y| x * y);
                 acc(&mut grads, a, reduce_to(&da, av));
                 acc(&mut grads, b, reduce_to(&db, bv));
             }
+            // 行列積は要素ごとに書けないので専用関数へ（dA = g B^T, dB = A^T g 等）。
             Op::MatMul(a, b) => {
                 matmul_backward(&mut grads, &g, a, b, nodes);
             }
+            // c = -a。∂c/∂a = -1。要素ごとの単項なので reduce_to は不要（同 shape）。
             Op::Neg(a) => {
                 acc(&mut grads, a, g.mapv(|v| -v));
             }
+            // c = exp(a)。∂c/∂a = exp(a) = c。forward 値 c を使い回せる（再計算しない）。
             Op::Exp(a) => {
-                // d/da = g * exp(a) = g * c
                 let cv = &nodes[i].value;
                 acc(&mut grads, a, ew(&g, cv, |x, y| x * y));
             }
+            // c = ln(a)。∂c/∂a = 1/a。
             Op::Log(a) => {
                 let av = &nodes[a].value;
                 acc(&mut grads, a, ew(&g, av, |x, y| x / y));
             }
+            // c = tanh(a)。∂c/∂a = 1 - tanh(a)^2 = 1 - c^2（forward 値 c を再利用）。
             Op::Tanh(a) => {
-                // d/da = g * (1 - tanh(a)^2) = g * (1 - c^2)
                 let cv = &nodes[i].value;
                 let local = cv.mapv(|c| 1.0 - c * c);
                 acc(&mut grads, a, ew(&g, &local, |x, y| x * y));
             }
+            // c = sqrt(a)。∂c/∂a = 0.5 / sqrt(a) = 0.5 / c。
             Op::Sqrt(a) => {
-                // d/da = g * 0.5 / sqrt(a) = g * 0.5 / c
                 let cv = &nodes[i].value;
                 let local = cv.mapv(|c| 0.5 / c);
                 acc(&mut grads, a, ew(&g, &local, |x, y| x * y));
             }
+            // c = Σ a_i（テンソル → スカラー）。∂c/∂a_i = 1。
+            // 出力スカラーの随伴 s を、入力と同 shape の全要素へそのまま配る。
             Op::Sum(a) => {
-                // 出力スカラーの随伴を全要素へ等しく配る。
                 let s = g.first().copied().unwrap_or(0.0);
                 acc(&mut grads, a, ArrayD::from_elem(nodes[a].value.raw_dim(), s));
             }
+            // c = (Σ a_i)/n。∂c/∂a_i = 1/n。随伴 s を n で割って全要素へ配る。
             Op::Mean(a) => {
                 let av = &nodes[a].value;
                 let cnt = av.len().max(1) as f64;

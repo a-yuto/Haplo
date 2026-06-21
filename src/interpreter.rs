@@ -803,12 +803,18 @@ mod tests {
     use crate::lexer::lex;
     use crate::parser::parse;
 
+    // Haplo ソース文字列を lex → parse → eval まで通し、main の評価結果を返すヘルパ。
+    // テストでは「言語として動くか」を end-to-end で見たいので、パイプライン全段を通す。
+    // 各段のエラーは expect で即パニックさせる（テストなので失敗箇所が分かれば十分）。
     fn run(src: &str) -> Value {
         let tokens = lex(src).expect("lex error");
         let program = parse(&tokens).expect("parse error");
         eval_program(&program).expect("eval error")
     }
 
+    // run の結果がスカラーであることを前提に f64 を取り出すヘルパ。
+    // Int も Float に昇格して返すので、`6`（Int）と `6.0`（Float）の両方を許容できる。
+    // テンソルやクロージャが返ってきたらテストの想定違いなのでパニックさせる。
     fn run_f(src: &str) -> f64 {
         match run(src) {
             Value::Float(x) => x,
@@ -817,6 +823,9 @@ mod tests {
         }
     }
 
+    // run の結果がテンソルであることを前提に ArrayD<f64> を取り出すヘルパ（P1 で追加）。
+    // grad/iterate/reshape の戻り値はテンソルなので、要素を添字でアサートしたいときに使う。
+    // Rc の中身を clone して所有権を取り、t[[i]] のような添字アクセスを書きやすくする。
     fn run_t(src: &str) -> ArrayD<f64> {
         match run(src) {
             Value::Tensor(t) => (*t).clone(),
@@ -1039,16 +1048,24 @@ main = a @ a
     }
 
     // ----- P1: 前方参照・相互再帰（two-pass スコープ） -----
+    // P0 の env はソース順の線形スコープで前方参照ができなかった。P1 で Env に共有
+    // globals マップを足し、build_global_env を「関数→値」の two-pass にしたことで、
+    // 関数は順不同に互いを参照できるようになった。以下はその回帰テスト。
 
     #[test]
     fn p1_forward_reference() {
-        // main が f より前に定義されていても解決できる。
+        // main が f より「前」に書かれていても f を解決できることを確認する。
+        // pass2 で main を評価する時点では、pass1 で f が既に globals に登録済み。
+        // P0 ではここで UnboundVariable になっていた。
         let src = "main = f 3\nf x = x + 1";
         assert!(matches!(run(src), Value::Int(4)));
     }
 
     #[test]
     fn p1_mutual_recursion() {
+        // isEven と isOdd が互いを呼ぶ相互再帰。両方とも関数なので pass1 で
+        // 同じ globals にクロージャ登録され、呼び出し時に相手を解決できる（knot-tying）。
+        // isEven 10 → isOdd 9 → … → isEven 0 → true、と 10 段たどって true になる。
         let src = "
 isEven n = if n == 0 then true else isOdd (n - 1)
 isOdd n = if n == 0 then false else isEven (n - 1)
@@ -1059,28 +1076,36 @@ main = isEven 10
 
     #[test]
     fn p1_value_can_reference_later_function() {
-        // 値定義 a は後で定義される関数 g を参照できる（pass1 で全関数登録済み）。
+        // 値定義 a（`a = g 4`）が、後で定義される関数 g を参照できることを確認する。
+        // pass1 で全関数を登録してから pass2 で値を評価するので、値→関数の前方参照は OK。
+        // 逆に「値→後続の値」は pass2 が即時評価なので不可（これは仕様として許容）。
+        // g 4 = 4*4 = 16。
         let src = "a = g 4\ng x = x * x\nmain = a";
         assert!(matches!(run(src), Value::Int(16)));
     }
 
     // ----- P1: iterate -----
+    // iterate init n f = f を init に n 回適用した結果（builtin_iterate、ループ実装）。
 
     #[test]
     fn p1_iterate_scalar() {
+        // 0 に inc(=+1) を 5 回 → 5。多引数組み込み（arity 3）の部分適用も経由する:
+        // `iterate 0` → PartialBuiltin、`... 5` → PartialBuiltin、`... inc` で arity 到達 → 実行。
         let src = "inc x = x + 1\nmain = iterate 0 5 inc";
         assert!(matches!(run(src), Value::Int(5)));
     }
 
     #[test]
     fn p1_iterate_zero_times() {
+        // n=0 のときは f を一度も適用せず init をそのまま返す（境界条件）。
         let src = "inc x = x + 1\nmain = iterate 42 0 inc";
         assert!(matches!(run(src), Value::Int(42)));
     }
 
     #[test]
     fn p1_iterate_tensor() {
-        // 各ステップでテンソルに 1.0 を足す。
+        // init がテンソルでも動く（線形回帰の重み更新と同じ形）。
+        // zeros [2]=[0,0] に「+1.0」を 3 回 → [3,3]。テンソル+スカラーのブロードキャストも経由。
         let src = "bump v = v + 1.0\nmain = iterate (zeros [2]) 3 bump";
         let t = run_t(src);
         assert_eq!(t.shape(), &[2]);
@@ -1088,9 +1113,12 @@ main = isEven 10
     }
 
     // ----- P1: reshape -----
+    // P0 ではダミー実装（呼ぶと未定義変数エラー）だったものを本実装に置換した。
 
     #[test]
     fn p1_reshape() {
+        // 長さ4の1Dを 2x2 に変形。要素は row-major（行優先）で詰められる:
+        // [1,2,3,4] → [[1,2],[3,4]]。先頭 [0,0]=1、末尾 [1,1]=4 を確認。
         let t = run_t("main = reshape [1.0, 2.0, 3.0, 4.0] [2, 2]");
         assert_eq!(t.shape(), &[2, 2]);
         assert!((t[[0, 0]] - 1.0).abs() < 1e-9);
@@ -1099,15 +1127,21 @@ main = isEven 10
 
     #[test]
     fn p1_reshape_size_mismatch_errors() {
+        // 要素数3を 2x2(=4) に変形しようとするとエラーになることを確認する。
+        // run() は expect でパニックするため、ここでは run() を使わず eval_program の
+        // Result を直接受け取り is_err() を見る（エラーパスのテスト）。
         let tokens = crate::lexer::lex("main = reshape [1.0, 2.0, 3.0] [2, 2]").unwrap();
         let program = crate::parser::parse(&tokens).unwrap();
         assert!(eval_program(&program).is_err());
     }
 
     // ----- P1: スカラー左 Div / Pow ブロードキャスト -----
+    // P0 では Div/Pow はテンソルが左のときだけ対応していた（`t / s` は可、`s / t` は不可）。
+    // sigmoid の `1.0 / (1.0 + exp(-x))` のようにスカラーが左に来る式を書けるよう補った。
 
     #[test]
     fn p1_scalar_div_tensor() {
+        // 1.0 / [1,2,4] = [1, 0.5, 0.25]（要素ごとに s/x を計算）。
         let t = run_t("main = 1.0 / [1.0, 2.0, 4.0]");
         assert!((t[[0]] - 1.0).abs() < 1e-9);
         assert!((t[[1]] - 0.5).abs() < 1e-9);
@@ -1116,6 +1150,7 @@ main = isEven 10
 
     #[test]
     fn p1_scalar_pow_tensor() {
+        // 2.0 ^ [1,2,3] = [2, 4, 8]（要素ごとに s^x を計算）。
         let t = run_t("main = 2.0 ^ [1.0, 2.0, 3.0]");
         assert!((t[[0]] - 2.0).abs() < 1e-9);
         assert!((t[[1]] - 4.0).abs() < 1e-9);
@@ -1123,19 +1158,24 @@ main = isEven 10
     }
 
     // ----- P1: grad（reverse-mode autodiff） -----
+    // grad f x は f の x における勾配（x と同 shape のテンソル）を返す。
+    // 各テストは手計算できる関数を使い、autodiff の結果が解析解と一致するか検証する。
+    // これが合えば forward 計算とテープ backward の両方が正しいことの強い証拠になる。
 
     #[test]
     fn p1_grad_sum_square() {
-        // d/dw sum(w*w) = 2w
+        // f(w) = Σ w_i^2。各成分の偏微分は ∂f/∂w_i = 2 w_i なので、勾配は 2w。
+        // w=[3,-2,5] → [6,-4,10]。Mul（w*w）と Sum の backward を通る。
         let t = run_t("f w = sum (w * w)\nmain = grad f [3.0, -2.0, 5.0]");
         assert!((t[[0]] - 6.0).abs() < 1e-9);
-        assert!((t[[1]] + 4.0).abs() < 1e-9);
+        assert!((t[[1]] + 4.0).abs() < 1e-9); // -(-4)=+4 で 0 に近いことを確認
         assert!((t[[2]] - 10.0).abs() < 1e-9);
     }
 
     #[test]
     fn p1_grad_mean() {
-        // d/dw mean(w) = 1/n
+        // f(w) = mean(w) = (Σ w_i)/n。∂f/∂w_i = 1/n（全成分一定）。
+        // n=4 なので勾配は全要素 0.25。Mean の backward（随伴を 1/n で配る）を検証。
         let t = run_t("f w = mean w\nmain = grad f [1.0, 2.0, 3.0, 4.0]");
         assert_eq!(t.shape(), &[4]);
         for i in 0..4 {
@@ -1145,7 +1185,8 @@ main = isEven 10
 
     #[test]
     fn p1_grad_pow() {
-        // d/dw sum(w^2) = 2w
+        // f(w) = Σ w_i^2 を `w ^ 2`（Pow、定数指数）で書いた版。勾配は 2w。
+        // w=[1,2,3] → [2,4,6]。Pow の backward（g * b * a^(b-1)）を検証する。
         let t = run_t("f w = sum (w ^ 2)\nmain = grad f [1.0, 2.0, 3.0]");
         assert!((t[[0]] - 2.0).abs() < 1e-9);
         assert!((t[[1]] - 4.0).abs() < 1e-9);
@@ -1154,7 +1195,9 @@ main = isEven 10
 
     #[test]
     fn p1_grad_matmul() {
-        // d/dw sum(A @ w) = 各列の和（A^T @ ones）
+        // f(w) = Σ (A @ w)。A@w の i 成分は Σ_j A[i,j] w_j なので、
+        // ∂f/∂w_j = Σ_i A[i,j] = A の第 j 列の和（= A^T @ ones）。
+        // A=[[1,2],[3,4]] → 列和 [1+3, 2+4] = [4,6]。MatMul(2D×1D) の backward を検証。
         let src = "a = [1.0, 2.0; 3.0, 4.0]\nf w = sum (a @ w)\nmain = grad f [1.0, 1.0]";
         let t = run_t(src);
         assert!((t[[0]] - 4.0).abs() < 1e-9); // 1+3
@@ -1163,16 +1206,24 @@ main = isEven 10
 
     #[test]
     fn p1_grad_constant_is_zero() {
-        // f が入力を使わなければ勾配は 0。
+        // f(w) = 5.0 は入力 w に依存しない。このとき loss は Tracked にならないので、
+        // builtin_grad は「x と同 shape のゼロ」を返す（勾配 0）。その経路を検証する。
         let t = run_t("f w = 5.0\nmain = grad f [1.0, 2.0]");
         assert!(t.iter().all(|&x| x == 0.0));
     }
 
     // ----- G3: 北極星プログラム（線形回帰の学習ループ） -----
+    // P1 の総仕上げ。lexer/parser/テンソル/autodiff/反復が全てつながったことの証明。
 
     #[test]
     fn g3_linreg_converges() {
-        // grad + iterate + テンソル演算が連動し、損失が単調に大きく減少する。
+        // grad（勾配）+ iterate（反復）+ テンソル演算が連動して学習が進むことを確認する。
+        // main は [学習前の損失, 学習後の損失] を返す。勾配降下が効いていれば
+        // 学習後の損失は学習前より桁違いに小さくなるはず。
+        //   predict: feats @ w + b（線形予測）
+        //   mse:     mean((pred - target)^2)（平均二乗誤差）
+        //   step:    w <- w - lr * ∇loss(w)（1ステップの勾配降下）
+        //   trained: zeros[3] から step を 1000 回反復した重み
         let src = "
 x = [1.0, 2.0, 3.0; 4.0, 5.0, 6.0; 7.0, 8.0, 9.0; 1.0, 0.0, 1.0]
 y = [1.0, 2.0, 3.0, 0.5]
@@ -1185,16 +1236,20 @@ trained = iterate (zeros [3]) 1000 step
 main = [loss (zeros [3]), loss trained]
 ";
         let t = run_t(src);
-        let before = t[[0]];
-        let after = t[[1]];
+        let before = t[[0]]; // 重み 0 での損失（大きい）
+        let after = t[[1]]; // 1000 ステップ学習後の損失（小さいはず）
         assert!(before > 1.0, "初期損失が大きいはず: {}", before);
+        // 損失が 1/100 未満まで落ちていれば、勾配の符号・大きさが正しい強い証拠。
         assert!(after < before * 0.01, "損失が大きく減少するはず: {} -> {}", before, after);
-        assert!(after.is_finite());
+        assert!(after.is_finite()); // 発散して NaN/Inf になっていないこと
     }
 
     #[test]
     fn g3_northern_star_shape() {
-        // SPEC §3.8 の main がそのまま走り、Tensor[3] を返す。
+        // SPEC §3.8 の北極星プログラムを、main が iterate の結果（学習後の重み）を
+        // そのまま返す形（仕様どおり）で走らせる。converges 版と違い損失ではなく
+        // main の戻り型に注目し、重みが Tensor[3] で有限値であることを確認する。
+        // 「SPEC のサンプルがそのまま動く」= G3 達成の証明。
         let src = "
 x = [1.0, 2.0, 3.0; 4.0, 5.0, 6.0; 7.0, 8.0, 9.0; 1.0, 0.0, 1.0]
 y = [1.0, 2.0, 3.0, 0.5]
@@ -1206,7 +1261,7 @@ step w = w - lr * grad loss w
 main = iterate (zeros [3]) 1000 step
 ";
         let t = run_t(src);
-        assert_eq!(t.shape(), &[3]);
-        assert!(t.iter().all(|x| x.is_finite()));
+        assert_eq!(t.shape(), &[3]); // 重みは3次元（特徴数）
+        assert!(t.iter().all(|x| x.is_finite())); // 発散していないこと
     }
 }

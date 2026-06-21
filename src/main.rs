@@ -134,14 +134,20 @@ main = a @ a
         }
     }
 
-    // 北極星プログラム（examples/linreg_train.hpl）を lex→parse→eval の
-    // パイプライン全体で実行し、学習後の重み Tensor[3] が得られることを確認する。
+    // 北極星プログラム（examples/linreg_train.hpl）を、ソース文字列ではなく
+    // 「実ファイルから読み込んで」end-to-end で実行する統合テスト。
+    // interpreter.rs 側の g3_* テストはインライン文字列だが、こちらは配布する
+    // サンプルファイルが実際に壊れていないことまで保証する（例が腐らないようにする）。
+    // run() は lex→parse→eval の全段を通すので、ファイル1本で P1 全機能の通し確認になる。
     #[test]
     fn integration_g3_linreg_example_file() {
+        // CARGO のテストはクレートルートが作業ディレクトリなので相対パスで読める。
         let src = std::fs::read_to_string("examples/linreg_train.hpl")
             .expect("examples/linreg_train.hpl が読めません");
         let val = run(&src).unwrap();
         match val {
+            // main は学習後の重み Tensor[3]。形と有限性だけ確認する
+            // （具体的な数値は g3_linreg_converges 側で損失減少として検証済み）。
             Value::Tensor(t) => {
                 assert_eq!(t.shape(), &[3]);
                 assert!(t.iter().all(|x| x.is_finite()));
