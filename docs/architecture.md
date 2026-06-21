@@ -19,6 +19,7 @@ Haplo/
     ├── lexer.rs        # トークナイザ
     ├── parser.rs       # 再帰下降パーサ
     ├── value.rs        # Value / Env / EvalError
+    ├── autodiff.rs     # reverse-mode 自動微分テープ（P1）
     ├── interpreter.rs  # ツリーウォーキング評価器
     └── main.rs         # CLI エントリポイント + run()
 ```
@@ -33,13 +34,35 @@ Haplo/
 
 - 組み込み関数（`sum`, `mean` 等）は `Value::Builtin` として環境に注入。`eval()` 内で名前を特別扱いしない。これにより |> パイプでも通常どおり使える
 - 多引数関数は `desugar_lambda` でカリー化（`f x y = body` → `Lambda{x, Lambda{y, body}}`）。`rev().fold()` の順序に注意（rev なしだと引数順が逆になる）
-- グローバル環境はファイルの記述順に構築（**前方参照不可**、P1 で two-pass 対応予定）
+- 多引数組み込み（`reshape`/`grad`/`iterate`）は `Value::PartialBuiltin` で部分適用を貯め、arity に達したら実行する。`apply` が arity を見て分岐する
+- グローバル環境は **two-pass** で構築（P1）。pass1 で関数定義をクロージャ化して共有 globals に登録（前方参照・相互再帰可）、pass2 で値定義をソース順に評価。値定義の前方参照は不可（評価が即時のため）
+
+---
+
+## 自動微分（autodiff.rs — P1）
+
+reverse-mode 自動微分。演算を実行するたびに「演算ノード」を `thread_local` のテープ
+（Wengert list）へ順に積み、`backward()` で末尾（出力）から逆向きに随伴を累積する。
+
+- **thread_local テープを選んだ理由**: ツリーウォーキングの `eval()` は AST を深く再帰
+  するため、`&mut Tape` を全段に通すとシグネチャ変更が広範囲に及ぶ。thread_local なら
+  `eval()` の形を変えずに、grad の評価中だけ記録フックを差し込める
+- `grad f x` は、入力 `x` を葉ノードにし、`f` を `Value::Tracked(node_id)` に適用して
+  loss を評価する。`eval_binop` と単項組み込み（exp/log/tanh/sqrt/sum/mean）が Tracked を
+  検出するとテープへ記録する。出力ノードから backward して入力の随伴を勾配として返す
+- スカラーは 0 次元 ArrayD で表す。これでスカラーとテンソルを同じノード型で扱え、
+  要素ごと演算の scalar↔tensor ブロードキャストも一様に書ける（`reduce_to` で逆操作）
+- `Value::Tracked` は grad のスコープ外には漏れない（通常の評価では生成されない）
 
 ---
 
 ## 環境（value.rs）
 
-- `Env` は Rc 永続連結リスト。`extend()` は O(1)、複数クロージャが同じ親 env を安全に共有できる
+- `Env` は2層構造（P1）。ローカル束縛（引数・let）は Rc 永続連結リスト、トップレベル
+  定義は共有 `Rc<RefCell<HashMap>>`（globals）。`lookup` は locals → globals の順に引く
+- locals を永続連結リストにする理由: `extend()` が O(1)、複数クロージャが同じ親 env を安全に共有できる
+- globals を共有可変マップにする理由: 前方参照・相互再帰のため。全クロージャが同じ
+  globals をキャプチャするので、定義後に追加された束縛も呼び出し時に解決できる（knot-tying）
 - `Value::Int` と `Value::Float` を分けて保持（整数除算の維持と表示の自然さのため。`6.0` → `"6.0"` と表示）
 - テンソルは `Rc<ArrayD<f64>>` でくるむ（クロージャキャプチャ時のコピーを O(1) に抑える）。Arc ではなく Rc を使うのは P0 がシングルスレッドだから
 
