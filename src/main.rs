@@ -162,6 +162,20 @@ main = a @ b
         }
     }
 
+    // P2 リグレッション: 再帰関数を CLI パイプライン（shape 検査 → eval）で end-to-end 実行できること。
+    // shape ドメインには実値が無く再帰が自然停止しないため、shape パスが無限再帰でクラッシュする
+    // バグがあった。深度・燃料の予算で打ち切る修正後、shape パスは Unknown を返して素通りし、
+    // eval が実値で再帰を正しく終端して答えを返す（相互再帰 isEven 10 = true）。
+    #[test]
+    fn integration_g4_recursion_runs_end_to_end() {
+        let src = "
+isEven n = if n == 0 then true else isOdd (n - 1)
+isOdd n = if n == 0 then false else isEven (n - 1)
+main = isEven 10
+";
+        assert!(matches!(run(src), Ok(Value::Bool(true))));
+    }
+
     // P2: 北極星プログラム（学習ループ）が shape 検査を偽陽性なく通過し、最後まで実行できること。
     // zeros 由来の Unknown が随所に伝播するが確定した矛盾は無いので、shape 段を素通りして
     // eval が学習後の重み Tensor[3] を返す。staging が正しいプログラムを壊さない最重要回帰。

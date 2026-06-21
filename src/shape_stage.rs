@@ -19,13 +19,88 @@
 //   AST 非依存の純粋ロジック（カリー化 desugar・組み込み arity）だけは
 //   interpreter から pub(crate) で借りて規則のずれを防ぐ。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::*;
 use crate::interpreter::{builtin_arity, desugar_lambda};
 use crate::value::BuiltinFn;
+
+// 再帰関数に対する shape 評価の停止保証。
+//
+// 問題: shape ドメインには「実値」が無いため、再帰関数の基底ケースを実値で判定して
+// 打ち切れない。さらに If は両枝を評価する（片方が再帰呼び出しでも辿ってしまう）。
+// このため再帰関数の shape 評価は自然には停止せず、無限再帰でスタックを溢れさせる。
+//
+// 対策は2系統の予算で「stack 深さ」と「総仕事量」の両方を縛る:
+//   - APPLY_DEPTH（復元あり）: クロージャ適用のネスト深度を制限し Rust の
+//     スタックオーバーフローを防ぐ。線形再帰（f n = ... f (n-1)）対策。
+//   - FUEL（消費のみ・復元なし）: クロージャ適用の総回数を制限し、分岐再帰
+//     （f n = ... f(n-1) + f(n-2) のように1呼び出しが複数の再帰を生む）で
+//     深さは浅くてもノード数が指数的に爆発するのを防ぐ。
+// どちらの上限に達しても、その適用は ShapeType::Unknown を返して打ち切る。
+// Unknown は健全に伝播するので、打ち切りによる偽陽性（誤ったエラー報告）は生じない。
+//
+// thread_local を使う理由: shape_eval/apply_shape は AST を深く相互再帰するため、
+// 予算カウンタを全段の引数に通すとシグネチャ変更が広範囲に及ぶ。autodiff のテープと
+// 同じく、thread_local なら関数の形を変えずに横断的な状態を差し込める。
+thread_local! {
+    static APPLY_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static FUEL: Cell<u64> = const { Cell::new(0) };
+}
+
+// クロージャ適用のネスト深度上限。これを超えたら適用を打ち切る。
+// 深度が積み上がるのは「クロージャの本体を評価している最中にさらにクロージャを適用する」
+// 真の呼び出しネスト＝実質的に再帰のときだけ。`f (g (h x))` のような逐次合成は各適用が
+// 戻ってから次を適用するので深度は積み上がらない（適用時点では深度 1〜2）。よって正常な
+// 非再帰コードがこの上限に達することはまずない。一方この shape 評価は Rust の再帰なので、
+// テストスレッド（デフォルト約2MBスタック）でも安全に辿れるよう控えめな値にする。
+// 64 段あれば現実の非再帰ネストには十分で、暴走再帰は確実に打ち切れる。
+const MAX_APPLY_DEPTH: usize = 64;
+
+// クロージャ適用の総回数上限（パス全体で消費する燃料）。分岐再帰の指数爆発を止める。
+// 正常プログラムの shape 評価はこれより桁違いに少ない適用回数で終わる。
+const MAX_APPLY_FUEL: u64 = 100_000;
+
+// クロージャ適用の深度を管理する RAII ガード。
+// enter() で深度を1増やし（上限超過なら None）、Drop で必ず1減らす。
+// `?` によるエラー伝播でも Drop が走るので、深度カウンタが片側だけずれることはない。
+struct DepthGuard;
+
+impl DepthGuard {
+    fn enter() -> Option<DepthGuard> {
+        APPLY_DEPTH.with(|d| {
+            let cur = d.get();
+            if cur >= MAX_APPLY_DEPTH {
+                None
+            } else {
+                d.set(cur + 1);
+                Some(DepthGuard)
+            }
+        })
+    }
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        APPLY_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+// 燃料を1消費する。残量があれば true、尽きていれば false。
+// 深度ガードと違い消費したら戻さない（総仕事量を縛るため）。
+fn consume_fuel() -> bool {
+    FUEL.with(|f| {
+        let remaining = f.get();
+        if remaining == 0 {
+            false
+        } else {
+            f.set(remaining - 1);
+            true
+        }
+    })
+}
 
 // 抽象ドメインの値。Value と1対1ではなく、shape の検査に必要な情報だけを持つ。
 #[derive(Debug, Clone)]
@@ -182,6 +257,11 @@ impl ShapeEnv {
 // main が無ければ Unknown を返す（NoMain は eval_program が実行時に報告するので、
 // shape パスはここでは黙って通す。エラー責務を二重化しない）。
 pub fn shape_eval_program(program: &Program) -> Result<ShapeType, ShapeError> {
+    // 再帰停止予算をパス開始時にリセットする。深度ガードは Drop で必ず戻るので
+    // 通常は 0 に復元されるが、念のため毎回明示リセットしてパスを自己完結にする。
+    APPLY_DEPTH.with(|d| d.set(0));
+    FUEL.with(|f| f.set(MAX_APPLY_FUEL));
+
     let env = build_shape_env(program)?;
     Ok(env.lookup("main").unwrap_or(ShapeType::Unknown))
 }
@@ -407,7 +487,18 @@ fn all_concrete(dims: &[DimVal]) -> Option<Vec<usize>> {
 fn apply_shape(f: ShapeType, arg: ShapeType) -> Result<ShapeType, ShapeError> {
     match f {
         // ユーザ関数: param を arg shape に束縛して body を再評価（カリー化対応）。
+        // 再帰関数で停止しないため、深度・燃料の両予算で打ち切る（詳細はファイル冒頭の
+        // thread_local ブロックのコメント参照）。どちらか尽きたら Unknown を返す。
         ShapeType::Closure(c) => {
+            // 深度ガード（Drop で必ず戻す）。上限超過なら適用せず Unknown で打ち切り。
+            let _guard = match DepthGuard::enter() {
+                Some(g) => g,
+                None => return Ok(ShapeType::Unknown),
+            };
+            // 総適用回数（燃料）も消費。尽きていれば Unknown で打ち切り。
+            if !consume_fuel() {
+                return Ok(ShapeType::Unknown);
+            }
             let new_env = c.env.extend(c.param.clone(), arg);
             shape_eval(&c.body, &new_env)
         }
@@ -727,5 +818,41 @@ main = 1
             check(src),
             Err(ShapeError::ElementwiseMismatch { .. })
         ));
+    }
+
+    // ----- G4: 再帰関数で shape パスが停止すること（無限再帰クラッシュの回帰） -----
+    // shape ドメインには実値が無いため再帰の基底ケースを実値で判定できず、さらに If が
+    // 両枝を評価するため、再帰関数の shape 評価は自然には停止しない。深度・燃料の予算で
+    // 打ち切ることで「停止して Ok を返す」ことを確認する。打ち切り箇所は Unknown を
+    // 伝播するので、誤ったエラー（偽陽性）にはならず Ok になる。
+    // これらのテストが「ハングせず・スタックを溢れさせず」完了すること自体が回帰の核心。
+
+    #[test]
+    fn g4_self_recursion_terminates() {
+        // 線形自己再帰。shape 評価は深度上限で打ち切られ、クラッシュせず Ok を返す。
+        // 結果は then(Scalar) と else(打ち切りで Unknown) が食い違うため Unknown になる。
+        let src = "f n = if n == 0 then 1 else f (n - 1)\nmain = f 5";
+        assert!(check(src).is_ok());
+    }
+
+    #[test]
+    fn g4_mutual_recursion_terminates() {
+        // 相互再帰（P1 の isEven/isOdd）。shape パスが無限再帰せず停止することを確認する。
+        // P2 導入前はこの形を CLI 実行すると shape パスがスタックを溢れさせていた。
+        let src = "
+isEven n = if n == 0 then true else isOdd (n - 1)
+isOdd n = if n == 0 then false else isEven (n - 1)
+main = isEven 10
+";
+        assert!(check(src).is_ok());
+    }
+
+    #[test]
+    fn g4_branching_recursion_terminates() {
+        // 分岐再帰（1回の呼び出しが複数の再帰を生む）。深度は浅くてもノード数が指数的に
+        // 増えうるため、深度ガードだけでなく燃料（総適用回数）の上限でも打ち切る必要がある。
+        // このテストが現実的な時間で完了することが、燃料による指数爆発抑止の回帰になる。
+        let src = "f n = if n <= 1 then n else f (n - 1) + f (n - 2)\nmain = f 20";
+        assert!(check(src).is_ok());
     }
 }
