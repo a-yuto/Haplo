@@ -1,15 +1,34 @@
-/// Haplo ツリーウォーキング評価器
+// Haplo のツリーウォーキングインタプリタ（tree-walking interpreter）。
+// AST（抽象構文木）のノードを再帰的に評価して Value を返す。
+//
+// 「ツリーウォーキング」を選んだ理由:
+// バイトコードコンパイラ方式（AST → 命令列 → VM）は高速だが複雑になる。
+// P1 で追加予定の autodiff テープ（計算グラフ）は、eval() の呼び出し順に
+// 演算を記録することで実装できるため、ツリーウォーキングの方が自然に統合できる。
+// バイトコード方式では eval の中間状態をテープに記録するフックが難しくなる。
 use ndarray::{ArrayD, IxDyn};
 use std::rc::Rc;
 
 use crate::ast::*;
 use crate::value::*;
 
+// プログラム全体を評価するエントリポイント。
+// トップレベル定義からグローバル環境を構築し、main を評価して返す。
+// main がなければ EvalError::NoMain を返す。
 pub fn eval_program(program: &Program) -> Result<Value, EvalError> {
     let env = build_global_env(program)?;
     env.lookup("main").ok_or(EvalError::NoMain)
 }
 
+// トップレベルの Binding を上から順に評価し、グローバル環境を構築する。
+// 評価順: ファイルの記述順（前から後）。
+// 各束縛は、それより前に定義された束縛だけが見える環境の中で評価される。
+// これは「順序依存の線形スコープ」であり、前方参照はできない。
+//
+// 相互再帰（例: f が g を呼び、g が f を呼ぶ）は P0 では未対応。
+// 対応するには2パス（まず名前だけ登録 → 次に本体を評価）が必要で、P1 で実装予定。
+//
+// TypeAnnotation はここで読み飛ばす（P0 では型検査をしないため）。
 fn build_global_env(program: &Program) -> Result<Env, EvalError> {
     let mut env = load_builtins(Env::empty());
     for item in program {
@@ -27,6 +46,12 @@ fn build_global_env(program: &Program) -> Result<Env, EvalError> {
     Ok(env)
 }
 
+// 組み込み関数を Value::Builtin として環境に注入する。
+// ユーザ定義関数と同じ仕組み（環境内の名前束縛）で提供することで、
+// eval() の App ブランチで特別扱いせずに済む。
+// 組み込みもユーザ定義関数と同じように |> で使えるのはこの設計のおかげ。
+// 代替: eval() 内で組み込み名を特別にマッチする方法もあるが、
+// 組み込みを追加するたびに eval() を修正する必要が生じ、拡張性が低い。
 fn load_builtins(env: Env) -> Env {
     let builtins: &[(&str, BuiltinFn)] = &[
         ("sum", BuiltinFn::Sum),
@@ -47,6 +72,17 @@ fn load_builtins(env: Env) -> Env {
     e
 }
 
+// 多引数関数定義をネストしたラムダ式に変換する（カリー化）。
+// "f x y = body" → Lambda{x, Lambda{y, body}}
+//
+// 実装: params を逆順（rev()）にしてから fold する。
+// fold は左から畳み込むため、params = [x, y] の場合:
+//   rev → [y, x]
+//   fold 初期値 body:
+//     1回目: Lambda{y, body}
+//     2回目: Lambda{x, Lambda{y, body}}  ← これが欲しい形
+// rev() なしで fold すると Lambda{y, Lambda{x, body}} になってしまい、
+// 引数の順序が逆になる。
 fn desugar_lambda(params: &[String], body: &Expr) -> Expr {
     params.iter().rev().fold(body.clone(), |acc, param| {
         Expr::Lambda {
@@ -88,12 +124,19 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             apply(fval, aval)
         }
 
+        // ラムダ式の評価: AST ノードをクロージャ（Value::Closure）に変換する。
+        // 実行はしない。現在の環境を env フィールドにキャプチャするだけ。
+        // 呼び出し（apply）は Expr::App の評価時に行われる。
         Expr::Lambda { param, body } => Ok(Value::Closure(Closure {
             param: param.clone(),
             body: *body.clone(),
             env: env.clone(),
         })),
 
+        // let 式の評価。value を先に評価して val を得てから、
+        // name を val に束縛した新しい環境 new_env を作り、body を評価する。
+        // params がある場合（`let f x = ...`）は desugar_lambda でラムダに変換してから評価。
+        // 元の環境 env は変更されないため、body の外では name は見えない（レキシカルスコープ）。
         Expr::Let {
             name,
             params,
@@ -130,6 +173,10 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     }
 }
 
+// 関数値 f を引数 arg に適用する。
+// Closure の場合: param を arg に束縛した新しい環境で body を評価する。
+// Builtin の場合: apply_builtin に委譲する。
+// それ以外の値（Int, Float 等）を適用しようとした場合はエラー。
 fn apply(f: Value, arg: Value) -> Result<Value, EvalError> {
     match f {
         Value::Closure(c) => {
@@ -144,6 +191,9 @@ fn apply(f: Value, arg: Value) -> Result<Value, EvalError> {
     }
 }
 
+// 組み込み関数の実装。各関数は Rust の標準ライブラリや ndarray に委譲する。
+// テンソルに対する mapv() は要素ごとに関数を適用して新しいテンソルを返す。
+// Rc を使っているため、元のテンソルはコピーされる（不変性を保つ）。
 fn apply_builtin(b: BuiltinFn, arg: Value) -> Result<Value, EvalError> {
     match b {
         BuiltinFn::Sum => {
@@ -219,9 +269,11 @@ fn apply_builtin(b: BuiltinFn, arg: Value) -> Result<Value, EvalError> {
             Ok(Value::Tensor(Rc::new(transposed.into_dyn())))
         }
         BuiltinFn::Reshape => {
-            // reshape はカリー化: reshape tensor shape
-            // 最初の引数がテンソル、第二引数が shape リスト
-            // ここでは最初の引数（テンソル）を受け取りクロージャを返す
+            // reshape はカリー化（1引数ずつ）: reshape tensor shape
+            // 最初の引数（テンソル）をクロージャの環境にキャプチャして返すが、
+            // 2番目の引数（shape）を受け取る処理はダミー実装。
+            // __reshape_applied__ は環境に存在しないため呼び出すと UnboundVariable エラー。
+            // P0 では reshape は未完成。P1 以降で正式対応する。
             Ok(Value::Closure(Closure {
                 param: "__shape__".to_string(),
                 body: Expr::Var("__reshape_applied__".to_string()), // dummy
@@ -249,6 +301,15 @@ fn extract_shape(v: Value) -> Result<Vec<usize>, EvalError> {
     }
 }
 
+// 二項演算子の評価。左辺・右辺の型の組み合わせで振る舞いが変わる。
+// パターンマッチの順序が重要: 具体的なケース（Int×Int）を先に書き、
+// 汎用的なフォールバック（Float 昇格）を後に書く。
+//
+// 型昇格のルール:
+//   Int × Int → Int（整数演算。5/2=2）
+//   Tensor × Tensor → Tensor（shape が一致する場合のみ）
+//   Tensor × スカラー → Tensor（全要素にスカラーを適用）
+//   それ以外 → Float に昇格して演算
 fn eval_binop(op: &BinOpKind, l: Value, r: Value) -> Result<Value, EvalError> {
     match (op, &l, &r) {
         // Int × Int 算術
@@ -266,6 +327,12 @@ fn eval_binop(op: &BinOpKind, l: Value, r: Value) -> Result<Value, EvalError> {
             Ok(Value::Int(a.pow(*b as u32)))
         }
 
+        // @ は行列積演算子（Python の PEP 465 由来）。
+        // ndarray の dot() を使うが、dot() は型が静的に決まっている（Array2.dot(Array2) 等）。
+        // ArrayD（動的ランク）から必要なランクの view を取り出すには into_dimensionality() を使う。
+        // 対応ケース:
+        //   2D × 2D → 2D（行列 × 行列）
+        //   2D × 1D → 1D（行列 × ベクトル）: 線形回帰の feats @ w に必要
         // テンソル演算
         (BinOpKind::MatMul, Value::Tensor(a), Value::Tensor(b)) => {
             use ndarray::{Ix1, Ix2};
@@ -326,6 +393,11 @@ fn eval_binop(op: &BinOpKind, l: Value, r: Value) -> Result<Value, EvalError> {
             Ok(Value::Tensor(Rc::new(c)))
         }
 
+        // テンソルとスカラーの演算は、ndarray の ScalarOperand トレイトで処理する。
+        // Rust はアドホック多相を持たないため、Tensor×Float と Tensor×Int を
+        // 別々のパターンとして列挙する必要がある（マクロで簡略化も可能だが可読性優先）。
+        // s - tensor（スカラーが左）の場合は ndarray が直接サポートしないため、
+        // ArrayD::from_elem でスカラーをブロードキャストしたテンソルを作成して減算する。
         // テンソル × スカラー ブロードキャスト
         (BinOpKind::Add, Value::Tensor(a), Value::Float(s)) => {
             Ok(Value::Tensor(Rc::new((**a).clone() + *s)))
@@ -415,6 +487,9 @@ fn eval_binop(op: &BinOpKind, l: Value, r: Value) -> Result<Value, EvalError> {
     }
 }
 
+// テンソル同士の要素ごと演算の前に shape が一致しているか確認する。
+// 不一致の場合は演算子名と両辺の shape を含むエラーを返す。
+// ndarray 自体も shape 不一致でパニックするが、事前チェックで分かりやすいメッセージを出す。
 fn check_shape_match(
     op: &'static str,
     a: &ArrayD<f64>,
@@ -445,6 +520,10 @@ fn values_equal(a: &Value, b: &Value) -> Result<bool, EvalError> {
     }
 }
 
+// 2つの数値の大小を「差（a - b）」として返す。
+// 正ならa>b、負ならa<b、0ならa==b。
+// 比較演算子（<, <=, >, >=）を一つの関数で処理できるため、
+// 同じ型チェックロジックを4回書かずに済む。
 fn compare_numeric(a: &Value, b: &Value) -> Result<f64, EvalError> {
     let x = match a {
         Value::Int(n) => *n as f64,
@@ -469,6 +548,17 @@ fn compare_numeric(a: &Value, b: &Value) -> Result<f64, EvalError> {
     Ok(x - y)
 }
 
+// テンソルリテラルの AST ノード（Vec<Vec<Expr>>）を評価して Tensor に変換する。
+// 処理の流れ:
+//   1. 全要素を eval() → coerce_to_float() で f64 に変換
+//   2. 全行の長さが同じか確認（非均一ならエラー）
+//   3. 行数が1なら Array1（1D）、複数行なら Array2（2D）を作成
+//   4. into_dyn() で ArrayD に変換し、Rc でくるんで返す
+//
+// 行数で 1D/2D を切り替える理由:
+// [1.0, 2.0] は 1D ベクトル（shape [2]）であってほしい。
+// もし常に Array2 を作ると shape [1, 2] になり、
+// ベクトルとして使う演算（matmul の右辺など）でランク不一致エラーになる。
 fn eval_tensor_lit(rows: &[Vec<Expr>], env: &Env) -> Result<Value, EvalError> {
     if rows.is_empty() || (rows.len() == 1 && rows[0].is_empty()) {
         // 空テンソル
