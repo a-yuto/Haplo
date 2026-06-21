@@ -6,8 +6,8 @@
 |---------|------|---------|
 | P0 | **完了** | lexer / parser / インタプリタ（スカラー+テンソル） |
 | P1 | **完了** | autodiff テープ、`grad`、`iterate`、前方参照 |
-| P2 | **次** | 静的 shape 検査（固定次元） |
-| P3 | 未着手 | 次元変数の単一化・shape 算術 |
+| P2 | **完了** | shape staging パス（`shape_stage.rs`、実行前に shape 不整合を検出） |
+| P3 | **次** | shape 検査を型に導入（固定次元）・次元変数の単一化・shape 算術 |
 | P4 | 未着手 | 完全な dependent 型 |
 
 ---
@@ -49,8 +49,8 @@ G3 = 線形回帰サンプル（`docs/spec-types.md` §3.8）が走ること。*
 | `case` 式 | AST に未定義 | P2 |
 | `fold` | 未実装 | P2 |
 | 値定義の前方参照 | 関数のみ対応（値はソース順評価） | 仕様として許容 |
-| パイプ `|>` の複数行 | 同一行のみ | P2 |
-| shape 静的検査 | 実行時チェックのみ | P2 |
+| パイプ `|>` の複数行 | 同一行のみ | P3 |
+| shape 静的検査 | **P2 で staging パス実装済み**（固定次元の不整合を実行前検出） | — |
 
 ---
 
@@ -78,7 +78,7 @@ G3 = 線形回帰サンプル（`docs/spec-types.md` §3.8）が走ること。*
 
 ---
 
-## テスト構成（現在 75 本）
+## テスト構成（現在 90 本）
 
 ```
 cargo test                       # 全テスト
@@ -86,9 +86,12 @@ cargo test g0                    # G0 スカラーテスト（interpreter.rs）
 cargo test g1                    # G1 テンソルテスト（interpreter.rs）
 cargo test p1                    # P1 grad/iterate/前方参照/reshape（interpreter.rs）
 cargo test g3                    # G3 北極星プログラム（interpreter.rs）
+cargo test g4                    # G4 shape staging（shape_stage.rs + 統合）
 cargo test integration           # 統合テスト（main.rs）
 ```
 
 テストは各ソースファイル末尾の `#[cfg(test)]` ブロックにある。
 インタプリタのテストが最多（`g0_*` スカラー 15 本、`g1_*` テンソル 10 本、
 `p1_*` autodiff/iterate/前方参照 ほか、`g3_*` 線形回帰の学習ループ）。
+P2 で `shape_stage.rs` に `g4_*`（shape 不整合検出・偽陽性ゼロ回帰）を追加。
+`main.rs` には shape 不整合が実行前に弾かれることを確認する統合テストも追加。

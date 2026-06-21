@@ -95,7 +95,9 @@ fn load_builtins(env: Env) -> Env {
 //     2回目: Lambda{x, Lambda{y, body}}  ← これが欲しい形
 // rev() なしで fold すると Lambda{y, Lambda{x, body}} になってしまい、
 // 引数の順序が逆になる。
-fn desugar_lambda(params: &[String], body: &Expr) -> Expr {
+// shape_stage（P2）も同じカリー化規則を使うため pub(crate) で共有する
+// （規則がずれると「eval は通るが shape_eval は別物」になりかねないため一本化）。
+pub(crate) fn desugar_lambda(params: &[String], body: &Expr) -> Expr {
     params.iter().rev().fold(body.clone(), |acc, param| {
         Expr::Lambda {
             param: param.clone(),
@@ -189,7 +191,8 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
 
 // 組み込み関数の引数個数（arity）。
 // 引数がそろうまで PartialBuiltin で部分適用を貯める。
-fn builtin_arity(b: BuiltinFn) -> usize {
+// shape_stage（P2）も同じ arity で部分適用を処理するため pub(crate) で共有する。
+pub(crate) fn builtin_arity(b: BuiltinFn) -> usize {
     match b {
         BuiltinFn::Reshape | BuiltinFn::Grad => 2,
         BuiltinFn::Iterate => 3,

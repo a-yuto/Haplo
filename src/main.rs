@@ -6,6 +6,7 @@ mod autodiff;
 mod interpreter;
 mod lexer;
 mod parser;
+mod shape_stage;
 mod value;
 
 use value::Value;
@@ -18,6 +19,7 @@ use value::Value;
 enum HaploError {
     Lex(lexer::LexError),
     Parse(parser::ParseError),
+    Shape(shape_stage::ShapeError),
     Eval(value::EvalError),
     Io(std::io::Error),
 }
@@ -27,6 +29,7 @@ impl std::fmt::Display for HaploError {
         match self {
             HaploError::Lex(e) => write!(f, "字句解析エラー: {}", e),
             HaploError::Parse(e) => write!(f, "構文解析エラー: {}", e),
+            HaploError::Shape(e) => write!(f, "shape 検査エラー: {}", e),
             HaploError::Eval(e) => write!(f, "評価エラー: {}", e),
             HaploError::Io(e) => write!(f, "IO エラー: {}", e),
         }
@@ -43,6 +46,11 @@ impl From<parser::ParseError> for HaploError {
         HaploError::Parse(e)
     }
 }
+impl From<shape_stage::ShapeError> for HaploError {
+    fn from(e: shape_stage::ShapeError) -> Self {
+        HaploError::Shape(e)
+    }
+}
 impl From<value::EvalError> for HaploError {
     fn from(e: value::EvalError) -> Self {
         HaploError::Eval(e)
@@ -56,11 +64,15 @@ impl From<std::io::Error> for HaploError {
 
 // ソース文字列を受け取り、評価結果の Value を返す純粋な関数。
 // ファイル読み込みや標準出力を行わないため、テストから直接呼べる。
-// パイプラインは: lex() → parse() → eval_program() の3段。
-// ? 演算子で各段のエラーを HaploError に変換しながら伝播させる。
+// パイプラインは: lex() → parse() → shape_eval_program() → eval_program() の4段。
+// shape_eval_program は P2 で追加した「実行前ゲート」。eval の前に shape 不整合
+// （行列積の内次元不一致・要素ごと演算の shape 不一致）を静的に検出して弾く。
+// shape を推論できない箇所は Unknown を伝播させ、正しいプログラムは素通しする
+// （偽陽性ゼロ方針）。? 演算子で各段のエラーを HaploError に変換しながら伝播させる。
 pub fn run(source: &str) -> Result<Value, HaploError> {
     let tokens = lexer::lex(source)?;
     let program = parser::parse(&tokens)?;
+    shape_stage::shape_eval_program(&program)?;
     let val = interpreter::eval_program(&program)?;
     Ok(val)
 }
@@ -131,6 +143,35 @@ main = a @ a
         match val {
             Value::Float(x) => assert!((x - 6.0).abs() < 1e-9),
             _ => panic!(),
+        }
+    }
+
+    // P2: shape 検査が run() のパイプラインに組み込まれ、不整合を「評価前」に弾くことを確認する。
+    // a(2×3) @ b(2×2) は内次元 3≠2 で行列積できない。eval まで進めば実行時エラーになるが、
+    // shape_eval_program が先に Shape エラーで止めるはず（G4 = 実行前検出）。
+    #[test]
+    fn integration_g4_shape_mismatch_rejected_before_eval() {
+        let src = "
+a = [1.0, 2.0, 3.0; 4.0, 5.0, 6.0]
+b = [1.0, 2.0; 3.0, 4.0]
+main = a @ b
+";
+        match run(src) {
+            Err(HaploError::Shape(_)) => {} // 期待どおり shape 段で弾かれた
+            other => panic!("shape エラーで弾かれるはず: {:?}", other),
+        }
+    }
+
+    // P2: 北極星プログラム（学習ループ）が shape 検査を偽陽性なく通過し、最後まで実行できること。
+    // zeros 由来の Unknown が随所に伝播するが確定した矛盾は無いので、shape 段を素通りして
+    // eval が学習後の重み Tensor[3] を返す。staging が正しいプログラムを壊さない最重要回帰。
+    #[test]
+    fn integration_g4_linreg_passes_shape_check() {
+        let src = std::fs::read_to_string("examples/linreg_train.hpl")
+            .expect("examples/linreg_train.hpl が読めません");
+        match run(&src) {
+            Ok(Value::Tensor(t)) => assert_eq!(t.shape(), &[3]),
+            other => panic!("Tensor[3] を期待: {:?}", other),
         }
     }
 
