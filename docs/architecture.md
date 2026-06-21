@@ -61,3 +61,37 @@ Haplo/
 - 演算子優先順位は**関数呼び出しチェーン**で実装（Pratt パーサ不採用）。`parse_additive` が `parse_matmul` を呼ぶ等、各優先順位レベルが独立した関数として見える
 - `next_starts_atom` から `Minus` を除外（`10 - 3` を `App(10, -3)` に誤解釈しないため。負数引数は `f (-3)` と書く）
 - `^` は再帰呼び出しで右結合を実現（`2^3^4` → `Pow(2, Pow(3, 4))`）
+
+---
+
+## Shape Staging パス（src/shape_stage.rs — P2 で実装予定）
+
+`interpreter.rs` と対称な設計。`Value` の代わりに `ShapeType` を返す `shape_eval()` を実装する。
+評価器と同じ AST を再帰的に歩くため、構造はほぼ鏡像になる。
+
+```
+pub fn shape_eval_program(program: &Program) -> Result<ShapeType, ShapeError>
+
+ShapeType:
+  Scalar                            // スカラー値
+  Tensor(Vec<DimVal>)               // テンソル（次元の列）
+  Fn(Box<ShapeType>, Box<ShapeType>) // 関数の shape（引数 → 戻り値）
+
+DimVal:
+  Concrete(usize)  // 具体的な次元（例: 3）     ← P2 で対応
+  Var(String)      // 次元変数（例: "m"）         ← P4 で単一化を追加
+  Unknown          // 推論不能（エラーにしない）
+```
+
+主な shape 規則：
+
+```
+Lit(Int|Float|Bool)  → Scalar
+TensorLit(rows)      → Tensor([rows.len(), rows[0].len()])  （行×列）
+BinOp(@,  a, b)      → 内次元一致チェック後 Tensor([m, n]) を返す
+BinOp(+, -等, a, b)  → a と b の shape が等しい場合のみ通過
+App(f, arg)          → ShapeType::Fn(arg_shape, ret) に f が合致するか確認
+```
+
+パイプライン統合：`main.rs` の `run()` で `eval_program()` の前に
+`shape_eval_program(&program)?` を呼ぶ（P2 で追加）。

@@ -62,12 +62,14 @@
   ▼ トークン列
   │ parser → AST
   ▼ AST
-  │ 型検査＋shape検査（依存型チェッカ）★最難関
+  │ shape staging（shape 抽象評価）★ P2 で実装
+  ▼ shape-annotated AST（ShapeType map）
+  │ 型検査＋shape検査（依存型チェッカ）★ P3〜P5
   ▼ 型付きAST
   │ 評価（インタプリタ）
   ├─ ndarray を呼んで計算
   └─ テープ記録 → 逆伝播（reverse-mode autodiff）
 ```
 
-主要部品：(1) lexer/parser、(2) 依存型チェッカ（次元の単一化・shape 算術・shape 推論）、
-(3) 評価器、(4) autodiff テープ、(5) ndarray ラッパ。
+主要部品：(1) lexer/parser、(2') shape 抽象評価器（staging pass — shape ドメインの tree-walking インタプリタ）、
+(2) 依存型チェッカ（次元の単一化・shape 算術・shape 推論）、(3) 評価器、(4) autodiff テープ、(5) ndarray ラッパ。
