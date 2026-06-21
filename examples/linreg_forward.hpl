@@ -1,0 +1,25 @@
+-- 線形回帰の forward pass と MSE 損失
+-- P0 機能のみで記述（grad / iterate は P1 で実装予定なので未使用）
+
+-- 予測: 入力 x に重み w を行列積し、バイアス b を足す
+--   x : Tensor[2,3]  w : Tensor[3,1]  ->  Tensor[2,1]
+predict x w b = x @ w + b
+
+-- 平均二乗誤差。let..in でローカル束縛、^ は要素ごとのべき乗
+mse pred y =
+    let diff = pred - y in
+    mean (diff ^ 2.0)
+
+-- 入力データ（2 サンプル × 3 特徴）
+x = [1.0, 2.0, 3.0;
+     4.0, 5.0, 6.0]
+
+-- 重み（3 特徴 → 1 出力）と正解ラベル
+w = [0.1;
+     0.2;
+     0.3]
+y = [1.0;
+     2.0]
+
+-- main が評価結果として表示される。スカラーの損失値が出る
+main = mse (predict x w 0.5) y
