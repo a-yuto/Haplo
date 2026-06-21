@@ -1,0 +1,19 @@
+-- 関数型スタイルのショーケース（スカラー中心）
+-- 使用: カリー化・部分適用、let..in、if then else、パイプ |>
+
+-- 多引数はカリー化される。add は 1 引数ずつ適用できる
+add a b = a + b
+square x = x * x
+
+-- 部分適用: add 10 は「10 を足す関数」
+addTen = add 10
+
+-- if は式。値を返すので束縛や引数にそのまま使える
+clamp lo hi x =
+    if x < lo then lo
+    else if x > hi then hi
+    else x
+
+-- パイプ |> は左の値を右の関数へ渡す（x |> f == f x）
+-- 5 -> square(=25) -> addTen(=35) -> clamp 0 30(=30)
+main = 5 |> square |> addTen |> clamp 0 30
