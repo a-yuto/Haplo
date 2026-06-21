@@ -10,6 +10,7 @@ use ndarray::{ArrayD, IxDyn};
 use std::rc::Rc;
 
 use crate::ast::*;
+use crate::autodiff;
 use crate::value::*;
 
 // プログラム全体を評価するエントリポイント。
@@ -20,38 +21,48 @@ pub fn eval_program(program: &Program) -> Result<Value, EvalError> {
     env.lookup("main").ok_or(EvalError::NoMain)
 }
 
-// トップレベルの Binding を上から順に評価し、グローバル環境を構築する。
-// 評価順: ファイルの記述順（前から後）。
-// 各束縛は、それより前に定義された束縛だけが見える環境の中で評価される。
-// これは「順序依存の線形スコープ」であり、前方参照はできない。
+// トップレベル定義からグローバル環境を two-pass で構築する。
 //
-// 相互再帰（例: f が g を呼び、g が f を呼ぶ）は P0 では未対応。
-// 対応するには2パス（まず名前だけ登録 → 次に本体を評価）が必要で、P1 で実装予定。
+// pass1: 関数定義（params あり）をクロージャ化して globals に登録する。
+//   クロージャは共有 globals マップをキャプチャするので、後から登録される定義も
+//   呼び出し時に解決できる。これにより前方参照と相互再帰が動く
+//   （例: f が後で定義される g を呼ぶ、f と g が互いを呼ぶ）。
+// pass2: 値定義（params なし）をソース順に評価して globals に登録する。
+//   値の評価は即時なので、後続の値定義は参照できない（前方参照は関数のみ）。
+//   ただし pass1 で全関数が登録済みなので、値定義から任意の関数は参照できる。
 //
-// TypeAnnotation はここで読み飛ばす（P0 では型検査をしないため）。
+// TypeAnnotation はここで読み飛ばす（P0/P1 では型検査をしないため）。
 fn build_global_env(program: &Program) -> Result<Env, EvalError> {
-    let mut env = load_builtins(Env::empty());
+    let env = load_builtins(Env::empty());
+
+    // pass1: 関数定義をクロージャ化（本体はまだ実行しない）。
     for item in program {
         if let TopLevel::Binding { name, params, body } = item {
-            let val = if params.is_empty() {
-                eval(body, &env)?
-            } else {
+            if !params.is_empty() {
                 let lambda = desugar_lambda(params, body);
-                eval(&lambda, &env)?
-            };
-            env = env.extend(name.clone(), val);
+                let cl = eval(&lambda, &env)?;
+                env.define_global(name.clone(), cl);
+            }
         }
-        // TypeAnnotation は P0 では無視
     }
+
+    // pass2: 値定義をソース順に評価。
+    for item in program {
+        if let TopLevel::Binding { name, params, body } = item {
+            if params.is_empty() {
+                let val = eval(body, &env)?;
+                env.define_global(name.clone(), val);
+            }
+        }
+    }
+
     Ok(env)
 }
 
-// 組み込み関数を Value::Builtin として環境に注入する。
+// 組み込み関数を Value::Builtin として共有 globals マップに注入する。
 // ユーザ定義関数と同じ仕組み（環境内の名前束縛）で提供することで、
 // eval() の App ブランチで特別扱いせずに済む。
 // 組み込みもユーザ定義関数と同じように |> で使えるのはこの設計のおかげ。
-// 代替: eval() 内で組み込み名を特別にマッチする方法もあるが、
-// 組み込みを追加するたびに eval() を修正する必要が生じ、拡張性が低い。
 fn load_builtins(env: Env) -> Env {
     let builtins: &[(&str, BuiltinFn)] = &[
         ("sum", BuiltinFn::Sum),
@@ -64,12 +75,13 @@ fn load_builtins(env: Env) -> Env {
         ("ones", BuiltinFn::Ones),
         ("transpose", BuiltinFn::Transpose),
         ("reshape", BuiltinFn::Reshape),
+        ("grad", BuiltinFn::Grad),
+        ("iterate", BuiltinFn::Iterate),
     ];
-    let mut e = env;
     for (name, f) in builtins {
-        e = e.extend(name.to_string(), Value::Builtin(*f));
+        env.define_global(name.to_string(), Value::Builtin(*f));
     }
-    e
+    env
 }
 
 // 多引数関数定義をネストしたラムダ式に変換する（カリー化）。
@@ -106,6 +118,8 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
             Value::Int(n) => Ok(Value::Int(-n)),
             Value::Float(x) => Ok(Value::Float(-x)),
             Value::Tensor(t) => Ok(Value::Tensor(Rc::new(t.mapv(|x| -x)))),
+            // grad 評価中の微分追跡値はテープへ符号反転を記録する。
+            Value::Tracked(id) => Ok(Value::Tracked(autodiff::neg(id))),
             other => Err(EvalError::TypeMismatch {
                 expected: "数値",
                 got: value_type_name(&other),
@@ -173,9 +187,19 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
     }
 }
 
+// 組み込み関数の引数個数（arity）。
+// 引数がそろうまで PartialBuiltin で部分適用を貯める。
+fn builtin_arity(b: BuiltinFn) -> usize {
+    match b {
+        BuiltinFn::Reshape | BuiltinFn::Grad => 2,
+        BuiltinFn::Iterate => 3,
+        _ => 1,
+    }
+}
+
 // 関数値 f を引数 arg に適用する。
 // Closure の場合: param を arg に束縛した新しい環境で body を評価する。
-// Builtin の場合: apply_builtin に委譲する。
+// Builtin の場合: arity に達していれば実行、未達なら PartialBuiltin に貯める。
 // それ以外の値（Int, Float 等）を適用しようとした場合はエラー。
 fn apply(f: Value, arg: Value) -> Result<Value, EvalError> {
     match f {
@@ -183,7 +207,21 @@ fn apply(f: Value, arg: Value) -> Result<Value, EvalError> {
             let new_env = c.env.extend(c.param.clone(), arg);
             eval(&c.body, &new_env)
         }
-        Value::Builtin(b) => apply_builtin(b, arg),
+        Value::Builtin(b) => {
+            if builtin_arity(b) == 1 {
+                apply_builtin(b, vec![arg])
+            } else {
+                Ok(Value::PartialBuiltin(b, vec![arg]))
+            }
+        }
+        Value::PartialBuiltin(b, mut args) => {
+            args.push(arg);
+            if args.len() == builtin_arity(b) {
+                apply_builtin(b, args)
+            } else {
+                Ok(Value::PartialBuiltin(b, args))
+            }
+        }
         other => Err(EvalError::TypeMismatch {
             expected: "関数",
             got: value_type_name(&other),
@@ -191,17 +229,41 @@ fn apply(f: Value, arg: Value) -> Result<Value, EvalError> {
     }
 }
 
-// 組み込み関数の実装。各関数は Rust の標準ライブラリや ndarray に委譲する。
+// 組み込み関数の実装。引数は arity 個そろった状態で渡される。
 // テンソルに対する mapv() は要素ごとに関数を適用して新しいテンソルを返す。
 // Rc を使っているため、元のテンソルはコピーされる（不変性を保つ）。
-fn apply_builtin(b: BuiltinFn, arg: Value) -> Result<Value, EvalError> {
+//
+// grad の評価中、単項組み込み（exp/log/tanh/sqrt/sum/mean）に Tracked 値が渡されると
+// テープへ演算を記録する必要がある。先頭でその分岐を処理する。
+fn apply_builtin(b: BuiltinFn, args: Vec<Value>) -> Result<Value, EvalError> {
+    // Tracked 引数の単項組み込みはテープへ記録する。
+    if args.len() == 1 {
+        if let Value::Tracked(id) = args[0] {
+            let nid = match b {
+                BuiltinFn::Exp => autodiff::exp(id),
+                BuiltinFn::Log => autodiff::log(id),
+                BuiltinFn::Tanh => autodiff::tanh(id),
+                BuiltinFn::Sqrt => autodiff::sqrt(id),
+                BuiltinFn::Sum => autodiff::sum(id),
+                BuiltinFn::Mean => autodiff::mean(id),
+                _ => {
+                    return Err(EvalError::InvalidArgument(format!(
+                        "組み込み {:?} は微分追跡値に適用できません",
+                        b
+                    )))
+                }
+            };
+            return Ok(Value::Tracked(nid));
+        }
+    }
+
     match b {
         BuiltinFn::Sum => {
-            let t = coerce_to_tensor(arg)?;
+            let t = coerce_to_tensor(args[0].clone())?;
             Ok(Value::Float(t.sum()))
         }
         BuiltinFn::Mean => {
-            let t = coerce_to_tensor(arg)?;
+            let t = coerce_to_tensor(args[0].clone())?;
             let n = t.len() as f64;
             if n == 0.0 {
                 return Err(EvalError::InvalidArgument(
@@ -210,7 +272,7 @@ fn apply_builtin(b: BuiltinFn, arg: Value) -> Result<Value, EvalError> {
             }
             Ok(Value::Float(t.sum() / n))
         }
-        BuiltinFn::Exp => match arg {
+        BuiltinFn::Exp => match args[0].clone() {
             Value::Float(x) => Ok(Value::Float(x.exp())),
             Value::Int(n) => Ok(Value::Float((n as f64).exp())),
             Value::Tensor(t) => Ok(Value::Tensor(Rc::new(t.mapv(f64::exp)))),
@@ -219,7 +281,7 @@ fn apply_builtin(b: BuiltinFn, arg: Value) -> Result<Value, EvalError> {
                 got: value_type_name(&other),
             }),
         },
-        BuiltinFn::Log => match arg {
+        BuiltinFn::Log => match args[0].clone() {
             Value::Float(x) => Ok(Value::Float(x.ln())),
             Value::Int(n) => Ok(Value::Float((n as f64).ln())),
             Value::Tensor(t) => Ok(Value::Tensor(Rc::new(t.mapv(f64::ln)))),
@@ -228,7 +290,7 @@ fn apply_builtin(b: BuiltinFn, arg: Value) -> Result<Value, EvalError> {
                 got: value_type_name(&other),
             }),
         },
-        BuiltinFn::Tanh => match arg {
+        BuiltinFn::Tanh => match args[0].clone() {
             Value::Float(x) => Ok(Value::Float(x.tanh())),
             Value::Int(n) => Ok(Value::Float((n as f64).tanh())),
             Value::Tensor(t) => Ok(Value::Tensor(Rc::new(t.mapv(f64::tanh)))),
@@ -237,7 +299,7 @@ fn apply_builtin(b: BuiltinFn, arg: Value) -> Result<Value, EvalError> {
                 got: value_type_name(&other),
             }),
         },
-        BuiltinFn::Sqrt => match arg {
+        BuiltinFn::Sqrt => match args[0].clone() {
             Value::Float(x) => Ok(Value::Float(x.sqrt())),
             Value::Int(n) => Ok(Value::Float((n as f64).sqrt())),
             Value::Tensor(t) => Ok(Value::Tensor(Rc::new(t.mapv(f64::sqrt)))),
@@ -247,17 +309,17 @@ fn apply_builtin(b: BuiltinFn, arg: Value) -> Result<Value, EvalError> {
             }),
         },
         BuiltinFn::Zeros => {
-            let shape = extract_shape(arg)?;
+            let shape = extract_shape(args[0].clone())?;
             let arr = ArrayD::<f64>::zeros(IxDyn(&shape));
             Ok(Value::Tensor(Rc::new(arr)))
         }
         BuiltinFn::Ones => {
-            let shape = extract_shape(arg)?;
+            let shape = extract_shape(args[0].clone())?;
             let arr = ArrayD::<f64>::ones(IxDyn(&shape));
             Ok(Value::Tensor(Rc::new(arr)))
         }
         BuiltinFn::Transpose => {
-            let t = coerce_to_tensor(arg)?;
+            let t = coerce_to_tensor(args[0].clone())?;
             if t.ndim() != 2 {
                 return Err(EvalError::TensorWrongRank {
                     op: "transpose",
@@ -268,19 +330,83 @@ fn apply_builtin(b: BuiltinFn, arg: Value) -> Result<Value, EvalError> {
             let transposed = t.t().to_owned();
             Ok(Value::Tensor(Rc::new(transposed.into_dyn())))
         }
+        // reshape tensor shape: テンソルの要素を新しい shape へ並べ替える。
+        // 要素数が一致しないとエラー。shape は Int またはテンソル（整数値の列）で指定する。
         BuiltinFn::Reshape => {
-            // reshape はカリー化（1引数ずつ）: reshape tensor shape
-            // 最初の引数（テンソル）をクロージャの環境にキャプチャして返すが、
-            // 2番目の引数（shape）を受け取る処理はダミー実装。
-            // __reshape_applied__ は環境に存在しないため呼び出すと UnboundVariable エラー。
-            // P0 では reshape は未完成。P1 以降で正式対応する。
-            Ok(Value::Closure(Closure {
-                param: "__shape__".to_string(),
-                body: Expr::Var("__reshape_applied__".to_string()), // dummy
-                env: Env::empty().extend("__tensor__".to_string(), arg),
-            }))
+            let t = coerce_to_tensor(args[0].clone())?;
+            let shape = extract_shape(args[1].clone())?;
+            let total: usize = shape.iter().product();
+            if total != t.len() {
+                return Err(EvalError::InvalidArgument(format!(
+                    "reshape: 要素数 {} を shape {:?}（要素数 {}）に変形できません",
+                    t.len(),
+                    shape,
+                    total
+                )));
+            }
+            let data: Vec<f64> = t.iter().copied().collect();
+            let arr = ArrayD::from_shape_vec(IxDyn(&shape), data)
+                .map_err(|_| EvalError::InvalidArgument("reshape: 変形に失敗".to_string()))?;
+            Ok(Value::Tensor(Rc::new(arr)))
         }
+        BuiltinFn::Grad => builtin_grad(args),
+        BuiltinFn::Iterate => builtin_iterate(args),
     }
+}
+
+// grad f x: スカラー値関数 f の x における勾配（x と同 shape のテンソル）を返す。
+// 手順:
+//   1. テープを開始し、x を葉ノードとして記録する。
+//   2. f を Tracked 入力に適用して loss を評価（演算がテープに積まれる）。
+//   3. 出力ノードから backward して入力ノードの随伴を取り出す。
+// f が入力に依存しない（結果が Tracked でない）場合は勾配 0 を返す。
+fn builtin_grad(args: Vec<Value>) -> Result<Value, EvalError> {
+    let f = args[0].clone();
+    let x = coerce_to_tensor(args[1].clone())?;
+
+    autodiff::tape_begin();
+    let input_id = autodiff::leaf((*x).clone());
+    let result = apply(f, Value::Tracked(input_id));
+
+    let grad_arr = match result {
+        Ok(Value::Tracked(out_id)) => {
+            let grads = autodiff::backward(out_id);
+            grads[input_id].clone()
+        }
+        // f が入力 x を使わなかった（定数）→ 勾配は 0。
+        Ok(_) => ArrayD::<f64>::zeros(x.raw_dim()),
+        Err(e) => {
+            autodiff::tape_end();
+            return Err(e);
+        }
+    };
+    autodiff::tape_end();
+
+    Ok(Value::Tensor(Rc::new(grad_arr)))
+}
+
+// iterate init n f: init に f を n 回適用した結果を返す。
+//   iterate a 0 f = a
+//   iterate a n f = iterate (f a) (n-1) f
+// 反復は再帰ではなくループで実装する（深い再帰によるスタック消費を避ける）。
+fn builtin_iterate(args: Vec<Value>) -> Result<Value, EvalError> {
+    let init = args[0].clone();
+    let n = match &args[1] {
+        Value::Int(k) => *k,
+        other => {
+            return Err(EvalError::TypeMismatch {
+                expected: "Int（反復回数）",
+                got: value_type_name(other),
+            })
+        }
+    };
+    let f = args[2].clone();
+
+    let mut acc = init;
+    for _ in 0..n.max(0) {
+        acc = apply(f.clone(), acc)?;
+    }
+    Ok(acc)
 }
 
 fn extract_shape(v: Value) -> Result<Vec<usize>, EvalError> {
@@ -311,6 +437,11 @@ fn extract_shape(v: Value) -> Result<Vec<usize>, EvalError> {
 //   Tensor × スカラー → Tensor（全要素にスカラーを適用）
 //   それ以外 → Float に昇格して演算
 fn eval_binop(op: &BinOpKind, l: Value, r: Value) -> Result<Value, EvalError> {
+    // grad の評価中、いずれかのオペランドが微分追跡値ならテープへ記録する。
+    // 定数側は leaf ノードに持ち上げてから演算ノードを積む。
+    if matches!(l, Value::Tracked(_)) || matches!(r, Value::Tracked(_)) {
+        return eval_binop_tracked(op, l, r);
+    }
     match (op, &l, &r) {
         // Int × Int 算術
         (BinOpKind::Add, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
@@ -428,6 +559,25 @@ fn eval_binop(op: &BinOpKind, l: Value, r: Value) -> Result<Value, EvalError> {
             Ok(Value::Tensor(Rc::new(a.mapv(|x| x.powf(exp)))))
         }
 
+        // スカラーが左の Div / Pow ブロードキャスト（s / t, s ^ t）。
+        // ndarray は scalar / Array を直接サポートしないため、要素ごとに計算する。
+        // Add/Sub/Mul はスカラー左右どちらも対応済みだが、Div/Pow はここで補う
+        // （sigmoid の 1.0 / (1.0 + exp(-x)) などを SPEC どおり書けるようにするため）。
+        (BinOpKind::Div, Value::Float(s), Value::Tensor(a)) => {
+            Ok(Value::Tensor(Rc::new(a.mapv(|x| *s / x))))
+        }
+        (BinOpKind::Div, Value::Int(n), Value::Tensor(a)) => {
+            let s = *n as f64;
+            Ok(Value::Tensor(Rc::new(a.mapv(|x| s / x))))
+        }
+        (BinOpKind::Pow, Value::Float(s), Value::Tensor(a)) => {
+            Ok(Value::Tensor(Rc::new(a.mapv(|x| s.powf(x)))))
+        }
+        (BinOpKind::Pow, Value::Int(n), Value::Tensor(a)) => {
+            let s = *n as f64;
+            Ok(Value::Tensor(Rc::new(a.mapv(|x| s.powf(x)))))
+        }
+
         // テンソル × Int スカラー（Int を f64 に昇格）
         (BinOpKind::Add, Value::Tensor(a), Value::Int(n)) => {
             Ok(Value::Tensor(Rc::new((**a).clone() + *n as f64)))
@@ -483,6 +633,44 @@ fn eval_binop(op: &BinOpKind, l: Value, r: Value) -> Result<Value, EvalError> {
         _ => Err(EvalError::TypeMismatch {
             expected: "互換性のある型",
             got: "非互換な型の組み合わせ",
+        }),
+    }
+}
+
+// 微分追跡値を含む二項演算をテープへ記録する。
+// 算術・行列積のみ対応（比較は微分不可）。定数オペランドは to_node で leaf に
+// 持ち上げてから autodiff::binop で演算ノードを積み、結果を Tracked で返す。
+fn eval_binop_tracked(op: &BinOpKind, l: Value, r: Value) -> Result<Value, EvalError> {
+    match op {
+        BinOpKind::Add
+        | BinOpKind::Sub
+        | BinOpKind::Mul
+        | BinOpKind::Div
+        | BinOpKind::Pow
+        | BinOpKind::MatMul => {
+            let a = to_node(&l)?;
+            let b = to_node(&r)?;
+            let id = autodiff::binop(op, a, b)?;
+            Ok(Value::Tracked(id))
+        }
+        _ => Err(EvalError::InvalidArgument(
+            "微分追跡値に比較演算子は使えません".to_string(),
+        )),
+    }
+}
+
+// Value をテープの葉ノード index に変換する。
+// すでに Tracked ならその index を、定数（テンソル/スカラー）なら leaf を積んで返す。
+// スカラーは autodiff::scalar で 0 次元 ArrayD にする。
+fn to_node(v: &Value) -> Result<usize, EvalError> {
+    match v {
+        Value::Tracked(id) => Ok(*id),
+        Value::Tensor(t) => Ok(autodiff::leaf((**t).clone())),
+        Value::Float(x) => Ok(autodiff::leaf(autodiff::scalar(*x))),
+        Value::Int(n) => Ok(autodiff::leaf(autodiff::scalar(*n as f64))),
+        other => Err(EvalError::TypeMismatch {
+            expected: "数値またはテンソル",
+            got: value_type_name(other),
         }),
     }
 }
@@ -604,6 +792,8 @@ fn value_type_name(v: &Value) -> &'static str {
         Value::Tensor(_) => "Tensor",
         Value::Closure(_) => "Closure",
         Value::Builtin(_) => "Builtin",
+        Value::PartialBuiltin(_, _) => "Builtin",
+        Value::Tracked(_) => "Tracked",
     }
 }
 
@@ -624,6 +814,13 @@ mod tests {
             Value::Float(x) => x,
             Value::Int(n) => n as f64,
             other => panic!("expected float, got {:?}", other),
+        }
+    }
+
+    fn run_t(src: &str) -> ArrayD<f64> {
+        match run(src) {
+            Value::Tensor(t) => (*t).clone(),
+            other => panic!("expected tensor, got {:?}", other),
         }
     }
 
@@ -839,5 +1036,177 @@ main = a @ a
     fn g1_exp() {
         let x = run_f("main = exp 0.0");
         assert!((x - 1.0).abs() < 1e-9);
+    }
+
+    // ----- P1: 前方参照・相互再帰（two-pass スコープ） -----
+
+    #[test]
+    fn p1_forward_reference() {
+        // main が f より前に定義されていても解決できる。
+        let src = "main = f 3\nf x = x + 1";
+        assert!(matches!(run(src), Value::Int(4)));
+    }
+
+    #[test]
+    fn p1_mutual_recursion() {
+        let src = "
+isEven n = if n == 0 then true else isOdd (n - 1)
+isOdd n = if n == 0 then false else isEven (n - 1)
+main = isEven 10
+";
+        assert!(matches!(run(src), Value::Bool(true)));
+    }
+
+    #[test]
+    fn p1_value_can_reference_later_function() {
+        // 値定義 a は後で定義される関数 g を参照できる（pass1 で全関数登録済み）。
+        let src = "a = g 4\ng x = x * x\nmain = a";
+        assert!(matches!(run(src), Value::Int(16)));
+    }
+
+    // ----- P1: iterate -----
+
+    #[test]
+    fn p1_iterate_scalar() {
+        let src = "inc x = x + 1\nmain = iterate 0 5 inc";
+        assert!(matches!(run(src), Value::Int(5)));
+    }
+
+    #[test]
+    fn p1_iterate_zero_times() {
+        let src = "inc x = x + 1\nmain = iterate 42 0 inc";
+        assert!(matches!(run(src), Value::Int(42)));
+    }
+
+    #[test]
+    fn p1_iterate_tensor() {
+        // 各ステップでテンソルに 1.0 を足す。
+        let src = "bump v = v + 1.0\nmain = iterate (zeros [2]) 3 bump";
+        let t = run_t(src);
+        assert_eq!(t.shape(), &[2]);
+        assert!((t[[0]] - 3.0).abs() < 1e-9);
+    }
+
+    // ----- P1: reshape -----
+
+    #[test]
+    fn p1_reshape() {
+        let t = run_t("main = reshape [1.0, 2.0, 3.0, 4.0] [2, 2]");
+        assert_eq!(t.shape(), &[2, 2]);
+        assert!((t[[0, 0]] - 1.0).abs() < 1e-9);
+        assert!((t[[1, 1]] - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p1_reshape_size_mismatch_errors() {
+        let tokens = crate::lexer::lex("main = reshape [1.0, 2.0, 3.0] [2, 2]").unwrap();
+        let program = crate::parser::parse(&tokens).unwrap();
+        assert!(eval_program(&program).is_err());
+    }
+
+    // ----- P1: スカラー左 Div / Pow ブロードキャスト -----
+
+    #[test]
+    fn p1_scalar_div_tensor() {
+        let t = run_t("main = 1.0 / [1.0, 2.0, 4.0]");
+        assert!((t[[0]] - 1.0).abs() < 1e-9);
+        assert!((t[[1]] - 0.5).abs() < 1e-9);
+        assert!((t[[2]] - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p1_scalar_pow_tensor() {
+        let t = run_t("main = 2.0 ^ [1.0, 2.0, 3.0]");
+        assert!((t[[0]] - 2.0).abs() < 1e-9);
+        assert!((t[[1]] - 4.0).abs() < 1e-9);
+        assert!((t[[2]] - 8.0).abs() < 1e-9);
+    }
+
+    // ----- P1: grad（reverse-mode autodiff） -----
+
+    #[test]
+    fn p1_grad_sum_square() {
+        // d/dw sum(w*w) = 2w
+        let t = run_t("f w = sum (w * w)\nmain = grad f [3.0, -2.0, 5.0]");
+        assert!((t[[0]] - 6.0).abs() < 1e-9);
+        assert!((t[[1]] + 4.0).abs() < 1e-9);
+        assert!((t[[2]] - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p1_grad_mean() {
+        // d/dw mean(w) = 1/n
+        let t = run_t("f w = mean w\nmain = grad f [1.0, 2.0, 3.0, 4.0]");
+        assert_eq!(t.shape(), &[4]);
+        for i in 0..4 {
+            assert!((t[[i]] - 0.25).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn p1_grad_pow() {
+        // d/dw sum(w^2) = 2w
+        let t = run_t("f w = sum (w ^ 2)\nmain = grad f [1.0, 2.0, 3.0]");
+        assert!((t[[0]] - 2.0).abs() < 1e-9);
+        assert!((t[[1]] - 4.0).abs() < 1e-9);
+        assert!((t[[2]] - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p1_grad_matmul() {
+        // d/dw sum(A @ w) = 各列の和（A^T @ ones）
+        let src = "a = [1.0, 2.0; 3.0, 4.0]\nf w = sum (a @ w)\nmain = grad f [1.0, 1.0]";
+        let t = run_t(src);
+        assert!((t[[0]] - 4.0).abs() < 1e-9); // 1+3
+        assert!((t[[1]] - 6.0).abs() < 1e-9); // 2+4
+    }
+
+    #[test]
+    fn p1_grad_constant_is_zero() {
+        // f が入力を使わなければ勾配は 0。
+        let t = run_t("f w = 5.0\nmain = grad f [1.0, 2.0]");
+        assert!(t.iter().all(|&x| x == 0.0));
+    }
+
+    // ----- G3: 北極星プログラム（線形回帰の学習ループ） -----
+
+    #[test]
+    fn g3_linreg_converges() {
+        // grad + iterate + テンソル演算が連動し、損失が単調に大きく減少する。
+        let src = "
+x = [1.0, 2.0, 3.0; 4.0, 5.0, 6.0; 7.0, 8.0, 9.0; 1.0, 0.0, 1.0]
+y = [1.0, 2.0, 3.0, 0.5]
+lr = 0.01
+predict feats w b = feats @ w + b
+mse pred target = mean ((pred - target) ^ 2)
+loss w = mse (predict x w 0.0) y
+step w = w - lr * grad loss w
+trained = iterate (zeros [3]) 1000 step
+main = [loss (zeros [3]), loss trained]
+";
+        let t = run_t(src);
+        let before = t[[0]];
+        let after = t[[1]];
+        assert!(before > 1.0, "初期損失が大きいはず: {}", before);
+        assert!(after < before * 0.01, "損失が大きく減少するはず: {} -> {}", before, after);
+        assert!(after.is_finite());
+    }
+
+    #[test]
+    fn g3_northern_star_shape() {
+        // SPEC §3.8 の main がそのまま走り、Tensor[3] を返す。
+        let src = "
+x = [1.0, 2.0, 3.0; 4.0, 5.0, 6.0; 7.0, 8.0, 9.0; 1.0, 0.0, 1.0]
+y = [1.0, 2.0, 3.0, 0.5]
+lr = 0.01
+predict feats w b = feats @ w + b
+mse pred target = mean ((pred - target) ^ 2)
+loss w = mse (predict x w 0.0) y
+step w = w - lr * grad loss w
+main = iterate (zeros [3]) 1000 step
+";
+        let t = run_t(src);
+        assert_eq!(t.shape(), &[3]);
+        assert!(t.iter().all(|x| x.is_finite()));
     }
 }

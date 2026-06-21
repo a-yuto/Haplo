@@ -2,6 +2,8 @@
 // インタプリタは式を評価して Value を返し、次の評価の入力として使う。
 
 use ndarray::ArrayD;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ast::Expr;
@@ -36,6 +38,16 @@ pub enum Value {
     // 代替案: 組み込みもダミーの Expr を body に持つ Closure にする方法があるが、
     // それだと apply() で Expr を評価しようとして無限ループやパニックのリスクがある。
     Builtin(BuiltinFn),
+    // 多引数組み込みの部分適用を表す。Vec に引数を貯め、arity に達したら実行する。
+    // reshape（2引数）・grad（2引数）・iterate（3引数）のように、カリー化された
+    // 組み込みを「引数を1つずつ受け取る」形で扱うために必要。
+    // 1引数組み込み（sum 等）は Builtin のまま即座に評価されるのでここには現れない。
+    PartialBuiltin(BuiltinFn, Vec<Value>),
+    // autodiff（自動微分）のテープノードを指す微分追跡値。
+    // grad の評価中だけ出現し、内部の usize は autodiff::Tape のノード index。
+    // テンソルとスカラーのどちらも表せる（ノードの value が 0 次元なら スカラー）。
+    // 通常の評価では生成されず、grad のスコープ外に漏れることもない。
+    Tracked(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,6 +62,8 @@ pub enum BuiltinFn {
     Ones,
     Transpose,
     Reshape,
+    Grad,
+    Iterate,
 }
 
 // ユーザ定義関数（クロージャ）の実行時表現。
@@ -68,54 +82,87 @@ pub struct Closure {
 }
 
 // 変数名から値へのマッピング（スコープ / 変数環境）。
-// 永続連結リストとして実装する。
+// 2層構造を持つ:
+//   - locals: ローカル束縛（関数引数・let）の永続連結リスト
+//   - globals: トップレベル定義を保持する共有可変マップ
 //
-// extend() は新しいノードを先頭に追加して新しい Env を返す（元の Env は変更しない）。
-// lookup() はリストを先頭から辿り、最初にヒットした束縛を返す。
-// これによってシャドーイング（同名の再束縛）が自動的に実現される。
-//
-// 永続データ構造を選んだ理由:
+// locals を永続連結リストにする理由:
 // クロージャは env をキャプチャするので、extend() のたびに HashMap をクローンすると
 // O(n) のコピーが走る。Rc 連結リストなら extend() は O(1) で、
 // 複数のクロージャが同じ親 env を安全に共有できる。
-// 代替: HashMap<String, Value> をクローンする方式はシンプルだが、
-// スコープが深くなるほど（クロージャのネスト等）コストが線形に増える。
+//
+// globals を Rc<RefCell<HashMap>> の共有マップにする理由:
+// 前方参照・相互再帰を可能にするため。全クロージャが同じ globals を共有して
+// キャプチャするので、定義後に globals へ追加された束縛も呼び出し時に解決できる
+// （knot-tying）。これにより f が後で定義される g を呼ぶ、といった相互再帰が動く。
 #[derive(Debug, Clone)]
-pub struct Env(pub Option<Rc<EnvNode>>);
+pub struct Env {
+    locals: Option<Rc<EnvNode>>,
+    globals: Rc<RefCell<HashMap<String, Value>>>,
+}
 
 #[derive(Debug)]
 pub struct EnvNode {
-    pub name: String,
-    pub value: Value,
-    pub parent: Env,
+    name: String,
+    value: Value,
+    parent: Option<Rc<EnvNode>>,
 }
 
 impl Env {
+    // 空のグローバルマップを持つ環境を作る（テストや単独のクロージャ用）。
     pub fn empty() -> Self {
-        Env(None)
+        Env {
+            locals: None,
+            globals: Rc::new(RefCell::new(HashMap::new())),
+        }
     }
 
-    // 現在の環境を親として、name → value の束縛を先頭に追加した新しい環境を返す。
-    // 元の環境は変更されないため、クロージャが Rc でキャプチャしている場合も安全。
+    // 既存の共有グローバルマップから環境を作る。
+    // build_global_env が全トップレベル定義で共有する globals を渡すために使う。
+    pub fn with_globals(globals: Rc<RefCell<HashMap<String, Value>>>) -> Self {
+        Env {
+            locals: None,
+            globals,
+        }
+    }
+
+    // 共有グローバルマップへの参照を返す（クローンは Rc の参照カウント増加のみ）。
+    pub fn globals(&self) -> Rc<RefCell<HashMap<String, Value>>> {
+        self.globals.clone()
+    }
+
+    // グローバルマップに束縛を1つ登録する。build_global_env の2パスで使う。
+    pub fn define_global(&self, name: String, value: Value) {
+        self.globals.borrow_mut().insert(name, value);
+    }
+
+    // 現在の環境を親として、name → value のローカル束縛を先頭に追加した新しい環境を返す。
+    // globals は共有したまま（Rc クローン）。元の環境は変更されないため、
+    // クロージャが Rc でキャプチャしている場合も安全。
     pub fn extend(&self, name: String, value: Value) -> Self {
-        Env(Some(Rc::new(EnvNode {
-            name,
-            value,
-            parent: self.clone(),
-        })))
+        Env {
+            locals: Some(Rc::new(EnvNode {
+                name,
+                value,
+                parent: self.locals.clone(),
+            })),
+            globals: self.globals.clone(),
+        }
     }
 
-    // 名前で変数を検索する。リストを先頭（最も新しい束縛）から辿る。
+    // 名前で変数を検索する。まず locals 連鎖を先頭（最も新しい束縛）から辿り、
+    // 見つからなければ globals マップを引く。
     // 同名が複数あれば最も近い（内側の）束縛が返される（シャドーイング）。
+    // ローカルがグローバルを覆い隠せるよう、locals を先に探す。
     pub fn lookup(&self, name: &str) -> Option<Value> {
-        let mut cur = &self.0;
+        let mut cur = &self.locals;
         while let Some(node) = cur {
             if node.name == name {
                 return Some(node.value.clone());
             }
-            cur = &node.parent.0;
+            cur = &node.parent;
         }
-        None
+        self.globals.borrow().get(name).cloned()
     }
 }
 
@@ -185,6 +232,8 @@ pub fn value_type_name(v: &Value) -> &'static str {
         Value::Tensor(_) => "Tensor",
         Value::Closure(_) => "Closure",
         Value::Builtin(_) => "Builtin",
+        Value::PartialBuiltin(_, _) => "Builtin",
+        Value::Tracked(_) => "Tracked",
     }
 }
 
@@ -235,6 +284,10 @@ impl std::fmt::Display for Value {
             Value::Tensor(t) => write!(f, "{}", t),
             Value::Closure(_) => write!(f, "<closure>"),
             Value::Builtin(b) => write!(f, "<builtin:{:?}>", b),
+            Value::PartialBuiltin(b, args) => {
+                write!(f, "<builtin:{:?} (部分適用 {} 引数)>", b, args.len())
+            }
+            Value::Tracked(_) => write!(f, "<tracked>"),
         }
     }
 }

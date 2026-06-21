@@ -2,6 +2,7 @@
 // run() 関数がテスト可能な純粋関数として字句解析→構文解析→評価のパイプラインを担い、
 // main() はファイル読み込みと標準出力への表示のみを担当する。
 mod ast;
+mod autodiff;
 mod interpreter;
 mod lexer;
 mod parser;
@@ -130,6 +131,22 @@ main = a @ a
         match val {
             Value::Float(x) => assert!((x - 6.0).abs() < 1e-9),
             _ => panic!(),
+        }
+    }
+
+    // 北極星プログラム（examples/linreg_train.hpl）を lex→parse→eval の
+    // パイプライン全体で実行し、学習後の重み Tensor[3] が得られることを確認する。
+    #[test]
+    fn integration_g3_linreg_example_file() {
+        let src = std::fs::read_to_string("examples/linreg_train.hpl")
+            .expect("examples/linreg_train.hpl が読めません");
+        let val = run(&src).unwrap();
+        match val {
+            Value::Tensor(t) => {
+                assert_eq!(t.shape(), &[3]);
+                assert!(t.iter().all(|x| x.is_finite()));
+            }
+            other => panic!("Tensor[3] を期待: {:?}", other),
         }
     }
 }
