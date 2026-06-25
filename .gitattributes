@@ -1,0 +1,14 @@
+# GitHub（Linguist）に .hpl の扱いを指示するファイル。
+#
+# Linguist は独自拡張子 .hpl を認識しないため、既存言語の文法を流用して
+# シンタックスハイライトを得る。Haplo は Elm に非常に近い構文
+#   ・型注釈がシングルコロン   例: x : Tensor[4, 3]
+#   ・関数型の矢印 ->          例: predict : Tensor[n, d] -> Tensor[d] -> f32 -> Tensor[n]
+#   ・パイプ |>               例: 5 |> square |> addTen
+#   ・行コメント --
+#   ・束縛 f x = body / let .. in / if then else
+# なので、Elm の文法で色付けすると自然に見える（Haskell は型注釈が :: のため不適）。
+#
+# linguist-language=Elm : .hpl を Elm としてハイライト
+# linguist-detectable   : リポジトリ言語統計（言語バー）にも .hpl を含める
+*.hpl linguist-language=Elm linguist-detectable=true
