@@ -176,6 +176,20 @@ main = isEven 10
         assert!(matches!(run(src), Ok(Value::Bool(true))));
     }
 
+    // 配布サンプル examples/shape_check.hpl が腐っていないことを保証する。
+    // 正しい shape だけで構成しているので shape 検査を通過し、eval が平均値を返す。
+    // 期待値 6.075 の根拠: a@w=[[2.2,2.8],[4.9,6.4]]、+bias(全1)+1.0(スカラー) で各要素 +2、
+    // mean((4.2+4.8+6.9+8.4)/4)=24.3/4=6.075。
+    #[test]
+    fn integration_g4_shape_check_example_file() {
+        let src = std::fs::read_to_string("examples/shape_check.hpl")
+            .expect("examples/shape_check.hpl が読めません");
+        match run(&src) {
+            Ok(Value::Float(x)) => assert!((x - 6.075).abs() < 1e-9, "got {}", x),
+            other => panic!("Float(6.075) を期待: {:?}", other),
+        }
+    }
+
     // P2: 北極星プログラム（学習ループ）が shape 検査を偽陽性なく通過し、最後まで実行できること。
     // zeros 由来の Unknown が随所に伝播するが確定した矛盾は無いので、shape 段を素通りして
     // eval が学習後の重み Tensor[3] を返す。staging が正しいプログラムを壊さない最重要回帰。
