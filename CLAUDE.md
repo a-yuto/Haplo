@@ -1,13 +1,13 @@
 # Haplo — Claude Code 向けプロジェクトガイド
 
 Haplo は機械学習向けの純粋関数型・静的型付き DSL（Rust 実装）。
-**現在のフェーズ: P1 完了（G3 達成済み — autodiff + `grad` + `iterate` + 前方参照）。次: P2 — 静的 shape 検査**
+**現在のフェーズ: P2 完了（G4 達成済み — shape staging パスで行列積・要素ごと演算の不整合を実行前に検出）。次: P3 — 次元変数の単一化・shape 算術**
 
 ## ビルド・テスト
 
 ```bash
 cargo build          # ビルド
-cargo test           # 全テスト（75本）
+cargo test           # 全テスト（95本）
 cargo run -- foo.hpl # ファイル実行
 cargo run -- examples/linreg_train.hpl  # 北極星プログラム（線形回帰の学習）
 ```
