@@ -183,19 +183,19 @@ impl<'a> Parser<'a> {
                 self.advance();
                 // "Tensor[m, n]" のような次元付きテンソル型を特別扱いでパースする。
                 // 次元には整数リテラル（固定サイズ）または識別子（次元変数）を許可する。
-                // P0 ではどちらも None として格納し、型検査では使わない。
-                // P2 以降の静的 shape 検査で活用する予定。
+                // 固定サイズは TypeDim::Fixed、次元変数は TypeDim::Var として名前ごと保持する。
+                // P2 までは変数名を捨てていたが、P3 の固定次元検査・P4 の単一化で使うため残す。
                 if name == "Tensor" && matches!(self.peek(), TokenKind::LBrack) {
                     self.advance(); // consume `[`
                     let mut dims = Vec::new();
                     loop {
                         match self.peek().clone() {
                             TokenKind::Int(n) => {
-                                dims.push(Some(n as usize));
+                                dims.push(TypeDim::Fixed(n as usize));
                                 self.advance();
                             }
-                            TokenKind::Ident(_) => {
-                                dims.push(None); // 次元変数（P0 では無視）
+                            TokenKind::Ident(var) => {
+                                dims.push(TypeDim::Var(var)); // 次元変数（名前を保持）
                                 self.advance();
                             }
                             _ => {}
@@ -710,6 +710,29 @@ mod tests {
     fn test_parse_type_annotation() {
         let prog = parse_str("f : Int -> Int");
         assert!(matches!(&prog[0], TopLevel::TypeAnnotation { name, .. } if name == "f"));
+    }
+
+    #[test]
+    fn test_parse_tensor_type_dims() {
+        // テンソル型の次元は、整数なら TypeDim::Fixed、識別子なら TypeDim::Var として
+        // 名前ごと保持されることを確認する（P3 で固定次元検査に使うため変数名を捨てない）。
+        // 戻り型は Arrow の右側に来るので、`Tensor[3, n]` を引数に持つ関数型で検査する。
+        let prog = parse_str("g : Tensor[3, n] -> Tensor[n]");
+        match &prog[0] {
+            TopLevel::TypeAnnotation { ty, .. } => match ty {
+                TypeExpr::Arrow(arg, _) => match arg.as_ref() {
+                    TypeExpr::Tensor(dims) => {
+                        assert_eq!(
+                            dims,
+                            &vec![TypeDim::Fixed(3), TypeDim::Var("n".to_string())]
+                        );
+                    }
+                    other => panic!("Tensor 型を期待: {:?}", other),
+                },
+                other => panic!("Arrow 型を期待: {:?}", other),
+            },
+            other => panic!("TypeAnnotation を期待: {:?}", other),
+        }
     }
 
     #[test]

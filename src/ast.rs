@@ -102,13 +102,26 @@ pub enum BinOpKind {
     Ge,
 }
 
-// 型式の AST。P0 では評価器に渡されず、パースして捨てるだけ。
-// 型注釈をパースエラーにせずに受け入れることで、要件定義書の文法例を
-// そのまま入力できる（型検査フェーズは P2 以降で実装する）。
+// 型式の AST。P0〜P2 では評価器に渡さずパースして保持するだけだったが、
+// P3 で shape staging パスが型注釈を読み、固定次元の検査に使うようになった。
+// 型注釈をパースエラーにせず受け入れることで、要件定義書の文法例をそのまま入力できる。
 #[derive(Debug, Clone)]
 pub enum TypeExpr {
     Named(String),
     Arrow(Box<TypeExpr>, Box<TypeExpr>),
-    Tensor(Vec<Option<usize>>),
+    // テンソル型 `Tensor[m, n, ...]`。各次元は固定サイズ（`Fixed`）または
+    // 次元変数（`Var`）。P2 までは `Vec<Option<usize>>` で変数名を捨てていたが、
+    // P3/P4 で次元変数を扱うため `TypeDim` で名前を保持するようにした。
+    Tensor(Vec<TypeDim>),
     App(Box<TypeExpr>, Box<TypeExpr>),
+}
+
+// テンソル型注釈の 1 次元ぶん。型式専用（実行時の `DimVal` とは別レイヤ）。
+//   Fixed(n) … 固定サイズ（例: `Tensor[3]`）。P3 の検査対象。
+//   Var(name) … 次元変数（例: `Tensor[n]`）。P3 では保持・伝播のみ、単一化は P4。
+// shape staging パスで `DimVal::{Concrete,Var}` に対応づける（shape_of_type）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeDim {
+    Fixed(usize),
+    Var(String),
 }

@@ -1,15 +1,18 @@
 # Haplo — Claude Code 向けプロジェクトガイド
 
 Haplo は機械学習向けの純粋関数型・静的型付き DSL（Rust 実装）。
-**現在のフェーズ: P2 完了（G4 達成済み — shape staging パスで行列積・要素ごと演算の不整合を実行前に検出）。次: P3 — 次元変数の単一化・shape 算術**
+**現在のフェーズ: P3 完了（型注釈駆動の shape 検査・固定次元 — 注釈付き関数の引数を宣言 shape に束縛して本体・戻り型を実行前に検査）。次: P4 — 次元変数の単一化・shape 算術**
+
+> ロードマップの正式版（[docs/spec-roadmap.md](docs/spec-roadmap.md)）に従い、P3 は固定次元（`Concrete`）の検査に絞る。次元変数（`Var`）は型注釈から `DimVal::Var` として保持・伝播するが、単一化と shape 算術（`m+n`）は P4 で導入する。
 
 ## ビルド・テスト
 
 ```bash
 cargo build          # ビルド
-cargo test           # 全テスト（95本）
+cargo test           # 全テスト（106本）
 cargo run -- foo.hpl # ファイル実行
 cargo run -- examples/linreg_train.hpl  # 北極星プログラム（線形回帰の学習）
+cargo run -- examples/type_check.hpl    # P3 型注釈駆動の shape 検査ショーケース
 ```
 
 ## ドキュメント
