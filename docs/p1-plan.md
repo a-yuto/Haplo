@@ -7,8 +7,9 @@
 | P0 | **完了** | lexer / parser / インタプリタ（スカラー+テンソル） |
 | P1 | **完了** | autodiff テープ、`grad`、`iterate`、前方参照 |
 | P2 | **完了** | shape staging パス（`shape_stage.rs`、実行前に shape 不整合を検出） |
-| P3 | **次** | shape 検査を型に導入（固定次元）・次元変数の単一化・shape 算術 |
-| P4 | 未着手 | 完全な dependent 型 |
+| P3 | **完了** | 型注釈駆動の shape 検査（固定次元）。注釈付き関数の引数を宣言 shape に束縛して本体・戻り型を検査（pass3） |
+| P4 | **次** | 次元変数の単一化・shape 算術（`m+n`） |
+| P5 | 未着手 | 完全な dependent 型（値依存の shape） |
 
 ---
 

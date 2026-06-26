@@ -158,6 +158,14 @@ pub enum ShapeError {
     },
     // テンソルリテラルの行の長さが揃っていない（eval と同じく早期に弾く）。
     NonUniformTensor,
+    // 型注釈で宣言した shape と、本体（関数の戻り値・グローバル値）から推論した
+    // shape が矛盾する（例: `f : Tensor[3] -> Tensor[2]` で `f w = w` は [3] を返す）。
+    // P3 で導入。偽陽性ゼロ方針のため「両方が完全 Concrete で食い違う」場合のみ報告する。
+    AnnotationMismatch {
+        name: String,
+        declared: Vec<DimVal>,
+        inferred: Vec<DimVal>,
+    },
 }
 
 impl std::fmt::Display for DimVal {
@@ -195,6 +203,17 @@ impl std::fmt::Display for ShapeError {
             ShapeError::NonUniformTensor => {
                 write!(f, "テンソルリテラルの行の長さが揃っていません")
             }
+            ShapeError::AnnotationMismatch {
+                name,
+                declared,
+                inferred,
+            } => write!(
+                f,
+                "`{}` の型注釈 {} と本体の shape {} が一致しません",
+                name,
+                fmt_dims(declared),
+                fmt_dims(inferred)
+            ),
         }
     }
 }
@@ -266,13 +285,28 @@ pub fn shape_eval_program(program: &Program) -> Result<ShapeType, ShapeError> {
     Ok(env.lookup("main").unwrap_or(ShapeType::Unknown))
 }
 
-// interpreter::build_global_env と同じ two-pass で ShapeEnv を構築する。
+// interpreter::build_global_env と同じ two-pass で ShapeEnv を構築し、さらに P3 で
+// 型注釈駆動の検査パス（pass3）を足す。
 //   pass1: 関数定義（params あり）を Closure 化して globals に登録（前方参照・相互再帰可）。
 //   pass2: 値定義（params なし）をソース順に shape 評価して登録。
+//          注釈があり推論値と宣言が両方 Concrete で矛盾すれば AnnotationMismatch。
+//          矛盾しなければ「より具体的な方」を登録して下流の検査精度を上げる。
 //          ここで値本体の shape 不整合（例: グローバル `bad = [1,2,3] + [1,2]`）も検出される。
-// TypeAnnotation は読み飛ばす（shape の静的解釈は P3 以降。P2 は式から shape を抽象評価する）。
+//   pass3: 型注釈付き関数の本体を「引数=宣言 shape」で検査する（P3 の中核）。
+//          リテラルからのボトムアップ推論では引数が Unknown になり本体が検査されない穴を、
+//          注釈の引数 shape を束縛することで塞ぐ。固定次元（Concrete）の矛盾のみ報告し、
+//          次元変数（Var）は伝播のみで単一化しない（偽陽性ゼロ。単一化は P4）。
 fn build_shape_env(program: &Program) -> Result<ShapeEnv, ShapeError> {
     let env = load_builtins(ShapeEnv::empty());
+
+    // 型注釈を name -> TypeExpr に集める。pass2/pass3 で参照する。
+    // 同名が複数あれば最後の注釈を採る（eval 側の定義規則に合わせ、ここでは厳密化しない）。
+    let mut annotations: HashMap<&str, &TypeExpr> = HashMap::new();
+    for item in program {
+        if let TopLevel::TypeAnnotation { name, ty } = item {
+            annotations.insert(name.as_str(), ty);
+        }
+    }
 
     // pass1: 関数定義を Closure 化（本体はまだ評価しない）。
     for item in program {
@@ -285,17 +319,139 @@ fn build_shape_env(program: &Program) -> Result<ShapeEnv, ShapeError> {
         }
     }
 
-    // pass2: 値定義をソース順に shape 評価。
+    // pass2: 値定義をソース順に shape 評価。注釈があれば突き合わせる。
     for item in program {
         if let TopLevel::Binding { name, params, body } = item {
             if params.is_empty() {
-                let val = shape_eval(body, &env)?;
-                env.define_global(name.clone(), val);
+                let inferred = shape_eval(body, &env)?;
+                // 注釈ありなら宣言 shape と推論 shape を突き合わせる。
+                // 宣言が Concrete Tensor で推論も Concrete Tensor かつ食い違うならエラー。
+                // 矛盾しないときは宣言 shape の方が具体（推論が Unknown でも宣言で確定できる）
+                // ことが多いので、宣言が Tensor なら宣言を、それ以外は推論値を登録する。
+                let to_register = match annotations.get(name.as_str()) {
+                    Some(ty) => {
+                        let declared = shape_of_type(ty);
+                        check_annotation(name, &declared, &inferred)?;
+                        if matches!(declared, ShapeType::Tensor(_)) {
+                            declared
+                        } else {
+                            inferred
+                        }
+                    }
+                    None => inferred,
+                };
+                env.define_global(name.clone(), to_register);
+            }
+        }
+    }
+
+    // pass3: 型注釈付き関数の本体を、引数を宣言 shape に束縛して検査する。
+    for item in program {
+        if let TopLevel::Binding { name, params, body } = item {
+            if !params.is_empty() {
+                if let Some(ty) = annotations.get(name.as_str()) {
+                    check_annotated_fn(name, params, body, ty, &env)?;
+                }
             }
         }
     }
 
     Ok(env)
+}
+
+// 型注釈付き関数の本体を検査する。注釈の Arrow を引数の数だけ剥がして各引数の
+// 宣言 shape を得て、globals 環境にそれらを束縛してから本体を shape 評価する。
+//   - 本体内の `@`/要素ごと演算の固定次元矛盾は shape_eval がそのまま surface する。
+//   - 本体から推論した戻り shape と、注釈の戻り shape が両方 Concrete で食い違えば
+//     AnnotationMismatch を報告する。
+// 注釈が引数より短い・戻りが関数型のまま等の「決め切れない」場合は Unknown 扱いにして
+// 黙って通す（偽陽性ゼロ）。
+fn check_annotated_fn(
+    name: &str,
+    params: &[String],
+    body: &Expr,
+    ty: &TypeExpr,
+    globals: &ShapeEnv,
+) -> Result<(), ShapeError> {
+    let (param_shapes, return_shape) = decompose_arrow(ty, params.len());
+
+    // 各引数を宣言 shape（足りない分は Unknown）に束縛した環境を作る。
+    let mut env = globals.clone();
+    for (i, p) in params.iter().enumerate() {
+        let s = param_shapes.get(i).cloned().unwrap_or(ShapeType::Unknown);
+        env = env.extend(p.clone(), s);
+    }
+
+    // 本体を評価。ここで本体内部の shape 不整合が検出される（pass3 の主目的）。
+    let inferred = shape_eval(body, &env)?;
+    // 戻り型の突き合わせ（両方 Concrete で矛盾するときだけエラー）。
+    check_annotation(name, &return_shape, &inferred)
+}
+
+// 宣言 shape と推論 shape の矛盾検査。偽陽性ゼロのため、両方が完全に Concrete な
+// Tensor で次元列が食い違うときだけ AnnotationMismatch を返す。
+// 片方でも Unknown/Var/Scalar/関数なら「矛盾と断定できない」ので Ok（黙って通す）。
+fn check_annotation(
+    name: &str,
+    declared: &ShapeType,
+    inferred: &ShapeType,
+) -> Result<(), ShapeError> {
+    if let (ShapeType::Tensor(d), ShapeType::Tensor(i)) = (declared, inferred) {
+        if let (Some(dv), Some(iv)) = (all_concrete(d), all_concrete(i)) {
+            if dv != iv {
+                return Err(ShapeError::AnnotationMismatch {
+                    name: name.to_string(),
+                    declared: d.clone(),
+                    inferred: i.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+// 型式を抽象 shape ドメインに変換する。固定次元は Concrete、次元変数は Var に対応づける。
+//   f32/f64/Int/Bool 等の基本型 → Scalar
+//   Tensor[..]                  → Tensor（Fixed→Concrete, Var→Var）
+//   Arrow/App/未知の Named      → Unknown（高階引数や型別名は P3 では shape を決めない）
+// Unknown を返す箇所は健全に伝播し偽陽性を生まない。
+fn shape_of_type(ty: &TypeExpr) -> ShapeType {
+    match ty {
+        TypeExpr::Named(n) => match n.as_str() {
+            "f32" | "f64" | "Int" | "Bool" | "Float" => ShapeType::Scalar,
+            _ => ShapeType::Unknown,
+        },
+        TypeExpr::Tensor(dims) => ShapeType::Tensor(
+            dims.iter()
+                .map(|d| match d {
+                    TypeDim::Fixed(n) => DimVal::Concrete(*n),
+                    TypeDim::Var(s) => DimVal::Var(s.clone()),
+                })
+                .collect(),
+        ),
+        // 関数型・型適用は shape を1つに決められないので Unknown（安全側）。
+        TypeExpr::Arrow(_, _) | TypeExpr::App(_, _) => ShapeType::Unknown,
+    }
+}
+
+// 関数型注釈を「引数 shape の列」と「戻り shape」に分解する。
+// arity（仮引数の個数）だけ Arrow を左から剥がす。注釈が arity より短ければ
+// 取れた分だけ返し（残りの引数は呼び出し側で Unknown 束縛）、戻りが Arrow のまま
+// なら戻り shape は Unknown（高階返り＝tensor 形に決められない）にする。
+fn decompose_arrow(ty: &TypeExpr, arity: usize) -> (Vec<ShapeType>, ShapeType) {
+    let mut params = Vec::new();
+    let mut cur = ty;
+    for _ in 0..arity {
+        match cur {
+            TypeExpr::Arrow(lhs, rhs) => {
+                params.push(shape_of_type(lhs));
+                cur = rhs;
+            }
+            // これ以上 Arrow が無い（注釈が引数より短い）なら打ち切る。
+            _ => break,
+        }
+    }
+    (params, shape_of_type(cur))
 }
 
 // 組み込み関数名を ShapeType::Builtin として globals に注入する。
@@ -853,6 +1009,133 @@ main = isEven 10
         // 増えうるため、深度ガードだけでなく燃料（総適用回数）の上限でも打ち切る必要がある。
         // このテストが現実的な時間で完了することが、燃料による指数爆発抑止の回帰になる。
         let src = "f n = if n <= 1 then n else f (n - 1) + f (n - 2)\nmain = f 20";
+        assert!(check(src).is_ok());
+    }
+
+    // ----- P3: 型注釈駆動の shape 検査（固定次元） -----
+    // P2 までは式（リテラル）からのボトムアップ推論のみで、関数引数は Unknown だった。
+    // P3 は型注釈を読み、引数を宣言 shape に束縛して本体を検査する（pass3）。
+    // 固定次元（Concrete）の矛盾だけを報告し、次元変数（Var）は伝播のみで単一化しない。
+
+    #[test]
+    fn p3_annotation_checks_body_mismatch() {
+        // 注釈付き関数の本体に潜む固定次元の不整合を検出する（P3 の中核）。
+        // main は f を呼ばないので P2 のボトムアップ推論では f の本体は評価されず見逃す。
+        // 注釈 `Tensor[3] -> Tensor[3]` で w を [3] に束縛すると、w + [1,2] が [3]+[2] で矛盾する。
+        let src = "
+f : Tensor[3] -> Tensor[3]
+f w = w + [1.0, 2.0]
+main = 1
+";
+        assert!(matches!(
+            check(src),
+            Err(ShapeError::ElementwiseMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn p3_return_type_mismatch() {
+        // 本体から推論した戻り shape と宣言戻り型が両方 Concrete で食い違えば AnnotationMismatch。
+        // f w = w は w（=[3]）をそのまま返すが、宣言戻り型は [2] なので矛盾する。
+        let src = "
+f : Tensor[3] -> Tensor[2]
+f w = w
+main = 1
+";
+        assert!(matches!(
+            check(src),
+            Err(ShapeError::AnnotationMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn p3_annotation_ok_no_false_positive() {
+        // 正しい注釈付き関数は通る。w + w は [3]、宣言戻り型 [3] と一致。
+        let src = "
+f : Tensor[3] -> Tensor[3]
+f w = w + w
+main = 1
+";
+        assert!(check(src).is_ok());
+    }
+
+    #[test]
+    fn p3_var_dims_no_false_positive() {
+        // 次元変数を含む注釈は P3 では単一化しないので、矛盾を断定せず通す（偽陽性ゼロ）。
+        // predict: [n,d] @ [d] は内次元が両方 Var(d) で dims_conflict=false → [n]。
+        // 宣言戻り型 [n] と推論 [Var(n)] はどちらも完全 Concrete でないので照合は通過する。
+        let src = "
+predict : Tensor[n, d] -> Tensor[d] -> Tensor[n]
+predict feats w = feats @ w
+main = 1
+";
+        assert!(check(src).is_ok());
+    }
+
+    #[test]
+    fn p3_global_value_annotation_mismatch() {
+        // グローバル値の注釈と本体の固定次元矛盾も pass2 で検出する。
+        // x の本体は [3] だが宣言は [2]。両方 Concrete で食い違うので AnnotationMismatch。
+        let src = "
+x : Tensor[2]
+x = [1.0, 2.0, 3.0]
+main = 1
+";
+        assert!(matches!(
+            check(src),
+            Err(ShapeError::AnnotationMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn p3_global_annotation_improves_precision() {
+        // 注釈付きグローバルは宣言 shape で登録されるため、推論不能（Unknown）な値でも
+        // 下流の検査が効くようになる（静的型が精度を上げる例）。
+        // w = zeros [3] は本来 Unknown だが、注釈 Tensor[3] で確定。下流の w + [1,2] が
+        // [3]+[2] で矛盾し検出される（注釈が無ければ Unknown 伝播で見逃していた）。
+        let src = "
+w : Tensor[3]
+w = zeros [3]
+main = w + [1.0, 2.0]
+";
+        assert!(matches!(
+            check(src),
+            Err(ShapeError::ElementwiseMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn p3_underspecified_annotation_is_lenient() {
+        // 注釈が引数より短い（部分注釈）場合、足りない引数は Unknown 束縛にして黙って通す。
+        // ここでは注釈が引数1個ぶんしか無いが f は2引数。2番目 b は Unknown となり、
+        // a + b は Unknown 側があるので矛盾を断定しない（偽陽性ゼロ）。
+        let src = "
+f : Tensor[3]
+f a b = a + b
+main = 1
+";
+        assert!(check(src).is_ok());
+    }
+
+    #[test]
+    fn p3_linreg_annotations_pass() {
+        // 北極星プログラムの完全な型注釈付き版が、pass3 の本体検査でも偽陽性なく通ること。
+        // loss/step は Tensor[3] 束縛で本体が評価され、predict/mse は次元変数で素通しになる。
+        let src = "
+x = [1.0, 2.0, 3.0; 4.0, 5.0, 6.0; 7.0, 8.0, 9.0; 1.0, 0.0, 1.0]
+y = [1.0, 2.0, 3.0, 0.5]
+lr = 0.01
+predict : Tensor[n, d] -> Tensor[d] -> f32 -> Tensor[n]
+predict feats w b = feats @ w + b
+mse : Tensor[n] -> Tensor[n] -> f32
+mse pred target = mean ((pred - target) ^ 2)
+loss : Tensor[3] -> f32
+loss w = mse (predict x w 0.0) y
+step : Tensor[3] -> Tensor[3]
+step w = w - lr * grad loss w
+main : Tensor[3]
+main = iterate (zeros [3]) 1000 step
+";
         assert!(check(src).is_ok());
     }
 }

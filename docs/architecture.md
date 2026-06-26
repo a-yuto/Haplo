@@ -28,12 +28,13 @@ Haplo/
     ├── value.rs        # Value / Env / EvalError
     ├── autodiff.rs     # reverse-mode 自動微分テープ（P1）
     ├── interpreter.rs  # ツリーウォーキング評価器
-    ├── shape_stage.rs  # shape staging パス（P2, 実行前の shape 検査）
+    ├── shape_stage.rs  # shape staging パス（P2 式推論 + P3 型注釈駆動検査）
     └── main.rs         # CLI エントリポイント + run()
 ```
 
 パイプライン: `lex()` → `parse()` → `shape_eval_program()` → `eval_program()` → `println!`
-（`shape_eval_program` は P2 で追加した実行前の shape 検査ゲート）
+（`shape_eval_program` は P2 で追加した実行前の shape 検査ゲート。P3 で型注釈駆動の
+本体検査（pass3）を追加し、注釈付き関数の引数を宣言 shape に束縛して本体・戻り型を検査する）
 
 ---
 

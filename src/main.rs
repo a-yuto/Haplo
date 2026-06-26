@@ -190,6 +190,38 @@ main = isEven 10
         }
     }
 
+    // P3: 型注釈駆動の shape 検査ショーケース examples/type_check.hpl が end-to-end で走ること。
+    // 注釈付き関数の本体が pass3 で検査されても偽陽性なく通過し、eval が単位行列 × [3,4] を返す。
+    // 期待値 [3,4] の根拠: w は単位行列なので apply w [3,4] = w @ [3,4] = [3,4]。
+    #[test]
+    fn integration_p3_type_check_example_file() {
+        let src = std::fs::read_to_string("examples/type_check.hpl")
+            .expect("examples/type_check.hpl が読めません");
+        match run(&src) {
+            Ok(Value::Tensor(t)) => {
+                assert_eq!(t.shape(), &[2]);
+                assert!((t[[0]] - 3.0).abs() < 1e-9 && (t[[1]] - 4.0).abs() < 1e-9);
+            }
+            other => panic!("Tensor[3,4] を期待: {:?}", other),
+        }
+    }
+
+    // P3 回帰: 型注釈の固定次元矛盾が「評価前」に shape 段で弾かれること。
+    // g : Tensor[2] -> Tensor[3] だが本体は引数（[2]）をそのまま返すので戻り型と矛盾する。
+    // 注釈が無ければボトムアップ推論では g 本体は呼ばれず見逃すケースを、注釈で捕捉する。
+    #[test]
+    fn integration_p3_annotation_mismatch_rejected_before_eval() {
+        let src = "
+g : Tensor[2] -> Tensor[3]
+g v = v
+main = 1
+";
+        match run(src) {
+            Err(HaploError::Shape(_)) => {} // 期待どおり shape 段で弾かれた
+            other => panic!("shape エラーで弾かれるはず: {:?}", other),
+        }
+    }
+
     // P2: 北極星プログラム（学習ループ）が shape 検査を偽陽性なく通過し、最後まで実行できること。
     // zeros 由来の Unknown が随所に伝播するが確定した矛盾は無いので、shape 段を素通りして
     // eval が学習後の重み Tensor[3] を返す。staging が正しいプログラムを壊さない最重要回帰。
