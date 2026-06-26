@@ -7,6 +7,7 @@ Haplo/
 ├── Cargo.toml          # 依存: ndarray = "0.16" のみ
 ├── SPEC.md             # 言語仕様インデックス
 ├── CLAUDE.md           # このガイドのインデックス
+├── .gitattributes      # GitHub(Linguist) で .hpl を Elm としてハイライト
 ├── docs/               # 詳細ドキュメント
 │   ├── spec-goals.md   # §0〜§2, §4, §5
 │   ├── spec-syntax.md  # §3.1〜§3.5
@@ -14,6 +15,12 @@ Haplo/
 │   ├── spec-roadmap.md # §6〜付録
 │   ├── architecture.md # このファイル
 │   └── p1-plan.md      # P1 実装計画・未完成箇所
+├── examples/           # 実行可能な Haplo サンプル（.hpl）
+│   ├── functional.hpl      # 関数型スタイル（カリー化・let..in・if・パイプ |>）
+│   ├── activations.hpl     # テンソル演算と組み込み（tanh/exp/sqrt/mean・@・ブロードキャスト）
+│   ├── linreg_forward.hpl  # 線形回帰の forward + MSE（P0 機能のみ）
+│   ├── linreg_train.hpl    # 北極星: 線形回帰の学習ループ（grad + iterate, G3）
+│   └── shape_check.hpl     # P2 shape 検査のショーケース（不一致の実行前検出, G4）
 └── src/
     ├── ast.rs          # AST 型定義（ロジックなし）
     ├── lexer.rs        # トークナイザ
@@ -21,10 +28,12 @@ Haplo/
     ├── value.rs        # Value / Env / EvalError
     ├── autodiff.rs     # reverse-mode 自動微分テープ（P1）
     ├── interpreter.rs  # ツリーウォーキング評価器
+    ├── shape_stage.rs  # shape staging パス（P2, 実行前の shape 検査）
     └── main.rs         # CLI エントリポイント + run()
 ```
 
-パイプライン: `lex()` → `parse()` → `eval_program()` → `println!`
+パイプライン: `lex()` → `parse()` → `shape_eval_program()` → `eval_program()` → `println!`
+（`shape_eval_program` は P2 で追加した実行前の shape 検査ゲート）
 
 ---
 
