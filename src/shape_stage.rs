@@ -160,11 +160,20 @@ pub enum ShapeError {
     NonUniformTensor,
     // 型注釈で宣言した shape と、本体（関数の戻り値・グローバル値）から推論した
     // shape が矛盾する（例: `f : Tensor[3] -> Tensor[2]` で `f w = w` は [3] を返す）。
-    // P3 で導入。偽陽性ゼロ方針のため「両方が完全 Concrete で食い違う」場合のみ報告する。
+    // P3 で導入。P4 でランク不一致・次元変数名不一致も対象に拡張。
     AnnotationMismatch {
         name: String,
         declared: Vec<DimVal>,
         inferred: Vec<DimVal>,
+    },
+    // P4 新規: 次元変数名が衝突する位置で使われた（単一化できない）。
+    // 例: `Tensor[n] + Tensor[m]`（n と m は独立した型変数なので等しい保証がない）。
+    // Concrete の不一致は ElementwiseMismatch/MatMulMismatch が担い、
+    // VarConflict は「両方が Var だが名前が異なる」場合専用。
+    VarConflict {
+        op: &'static str,
+        var_a: String,
+        var_b: String,
     },
 }
 
@@ -213,6 +222,11 @@ impl std::fmt::Display for ShapeError {
                 name,
                 fmt_dims(declared),
                 fmt_dims(inferred)
+            ),
+            ShapeError::VarConflict { op, var_a, var_b } => write!(
+                f,
+                "演算子 `{}` の次元変数 `{}` と `{}` が衝突しています（独立した変数のため等しい保証がありません）",
+                op, var_a, var_b
             ),
         }
     }
@@ -388,17 +402,39 @@ fn check_annotated_fn(
     check_annotation(name, &return_shape, &inferred)
 }
 
-// 宣言 shape と推論 shape の矛盾検査。偽陽性ゼロのため、両方が完全に Concrete な
-// Tensor で次元列が食い違うときだけ AnnotationMismatch を返す。
-// 片方でも Unknown/Var/Scalar/関数なら「矛盾と断定できない」ので Ok（黙って通す）。
+// 宣言 shape と推論 shape の矛盾検査。P4 で検査範囲を拡張:
+//   P3: 両方が完全に Concrete で次元列が食い違うときだけ AnnotationMismatch。
+//   P4: 以下も対象に追加（偽陽性ゼロ原則の下で断定できる範囲を広げた）。
+//     - ランク不一致（両方 Tensor で次元数が異なる）
+//     - 同一位置の次元変数名が異なる（宣言 Var(m) vs 推論 Var(n)：独立型変数なので不一致）
+//   Unknown/Scalar/関数型が絡む場合は「矛盾と断定できない」ので黙って通す（偽陽性回避）。
 fn check_annotation(
     name: &str,
     declared: &ShapeType,
     inferred: &ShapeType,
 ) -> Result<(), ShapeError> {
     if let (ShapeType::Tensor(d), ShapeType::Tensor(i)) = (declared, inferred) {
-        if let (Some(dv), Some(iv)) = (all_concrete(d), all_concrete(i)) {
-            if dv != iv {
+        // ランク不一致（P4 新規）。
+        if d.len() != i.len() {
+            return Err(ShapeError::AnnotationMismatch {
+                name: name.to_string(),
+                declared: d.clone(),
+                inferred: i.clone(),
+            });
+        }
+        // 次元ごとに衝突を検査する。
+        for (dd, di) in d.iter().zip(i.iter()) {
+            let mismatch = match (dd, di) {
+                // Concrete 同士で値が違う（P3 から）。
+                (DimVal::Concrete(a), DimVal::Concrete(b)) => a != b,
+                // Var 同士で名前が違う（P4 新規）。
+                // 宣言が Var(m)、推論が Var(n) で m≠n → 独立した型変数として不一致。
+                // 例: `f : Tensor[n] -> Tensor[m]` で本体が Tensor[n] を返す → AnnotationMismatch。
+                (DimVal::Var(a), DimVal::Var(b)) => a != b,
+                // Unknown・Concrete-Var 混在は断定不可 → 通す（偽陽性ゼロ）。
+                _ => false,
+            };
+            if mismatch {
                 return Err(ShapeError::AnnotationMismatch {
                     name: name.to_string(),
                     declared: d.clone(),
@@ -426,6 +462,10 @@ fn shape_of_type(ty: &TypeExpr) -> ShapeType {
                 .map(|d| match d {
                     TypeDim::Fixed(n) => DimVal::Concrete(*n),
                     TypeDim::Var(s) => DimVal::Var(s.clone()),
+                    // P4: shape 算術式（m+n, m*n 等）。concat/flatten 等のプリミティブが
+                    // 揃う P6 以降で評価対応予定。現時点では Unknown にフォールバックして
+                    // 偽陽性ゼロを保つ。
+                    TypeDim::Expr(_) => DimVal::Unknown,
                 })
                 .collect(),
         ),
@@ -573,20 +613,30 @@ fn shape_eval_binop(op: &BinOpKind, l: ShapeType, r: ShapeType) -> Result<ShapeT
 // 行列積の shape 規則。interpreter の matmul 分岐（2D×2D / 2D×1D のみ対応）を鏡写しにする。
 //   2D[m,k] @ 2D[k2,n] → [m,n]（内次元 k==k2 が必要）
 //   2D[m,k] @ 1D[k2]   → [m]  （内次元 k==k2 が必要）
-// 内次元が両方 Concrete で異なるときだけ MatMulMismatch を出す。
-// 片方でも Unknown 次元なら矛盾を断定できないので結果 Unknown（偽陽性回避）。
-// 未対応の rank 組み合わせ（1D×1D など）は eval が実行時に弾くので、ここは Unknown で通す。
+// P4 でエラー報告の種類を細分化:
+//   - 内次元が両方 Concrete で異なる → MatMulMismatch（P2 から）
+//   - 内次元が両方 Var で名前が異なる → VarConflict（P4 新規）
+//   - 片方が Unknown の場合は矛盾を断定できないので Unknown で通す（偽陽性回避）
+// 未対応の rank 組み合わせ（1D×1D など）は eval が実行時に弾くので Unknown で通す。
 fn matmul_shape(a: Vec<DimVal>, b: Vec<DimVal>) -> Result<ShapeType, ShapeError> {
     match (a.len(), b.len()) {
         (2, 2) => {
-            if dims_conflict(&a[1], &b[0]) {
-                return Err(ShapeError::MatMulMismatch { a, b });
+            match dim_pair_conflict(&a[1], &b[0]) {
+                DimConflictKind::ConcreteMismatch => return Err(ShapeError::MatMulMismatch { a, b }),
+                DimConflictKind::VarMismatch(va, vb) => {
+                    return Err(ShapeError::VarConflict { op: "@", var_a: va, var_b: vb })
+                }
+                DimConflictKind::Ok => {}
             }
             Ok(ShapeType::Tensor(vec![a[0].clone(), b[1].clone()]))
         }
         (2, 1) => {
-            if dims_conflict(&a[1], &b[0]) {
-                return Err(ShapeError::MatMulMismatch { a, b });
+            match dim_pair_conflict(&a[1], &b[0]) {
+                DimConflictKind::ConcreteMismatch => return Err(ShapeError::MatMulMismatch { a, b }),
+                DimConflictKind::VarMismatch(va, vb) => {
+                    return Err(ShapeError::VarConflict { op: "@", var_a: va, var_b: vb })
+                }
+                DimConflictKind::Ok => {}
             }
             Ok(ShapeType::Tensor(vec![a[0].clone()]))
         }
@@ -594,32 +644,69 @@ fn matmul_shape(a: Vec<DimVal>, b: Vec<DimVal>) -> Result<ShapeType, ShapeError>
     }
 }
 
-// 2つの次元が「確実に矛盾する」か。両方 Concrete で値が異なるときだけ true。
-// 片方でも Unknown/Var なら（P2 では）矛盾と断定しない。
-fn dims_conflict(x: &DimVal, y: &DimVal) -> bool {
-    matches!((x, y), (DimVal::Concrete(a), DimVal::Concrete(b)) if a != b)
+// 次元ペアの衝突種別。P4 で dims_conflict（bool）から細分化。
+// 衝突なし・Concrete 不一致・Var 名不一致の3種を区別することで
+// 下流が適切なエラー型（MatMulMismatch vs VarConflict）を報告できる。
+enum DimConflictKind {
+    // 衝突なし（同じ値 / 同名変数 / Unknown が絡む）。
+    Ok,
+    // 両方 Concrete で値が異なる。
+    ConcreteMismatch,
+    // 両方 Var だが名前が異なる（独立した型変数なので等しい保証がない）。
+    VarMismatch(String, String),
 }
 
-// 要素ごと演算の shape 規則。
-//   Tensor × Tensor : 両方が完全に Concrete で不一致なら ElementwiseMismatch。
-//                     一方でも Unknown 次元を含むなら Unknown（断定しない）。
-//   Tensor × Scalar / Scalar × Tensor : スカラーをブロードキャストして Tensor 側の shape。
-//   Scalar × Scalar : Scalar。
-//   それ以外（Closure/Unknown が絡む）: Unknown。
+// 2次元の衝突種別を判定する。
+//   (Concrete(a), Concrete(b)): a != b → ConcreteMismatch
+//   (Var(x),      Var(y)):      x != y → VarMismatch
+//   それ以外（同値 / Unknown 混在）: Ok
+// Unknown が絡む場合は偽陽性回避のため常に Ok を返す。
+fn dim_pair_conflict(x: &DimVal, y: &DimVal) -> DimConflictKind {
+    match (x, y) {
+        (DimVal::Concrete(a), DimVal::Concrete(b)) if a != b => DimConflictKind::ConcreteMismatch,
+        (DimVal::Var(a), DimVal::Var(b)) if a != b => {
+            DimConflictKind::VarMismatch(a.clone(), b.clone())
+        }
+        _ => DimConflictKind::Ok,
+    }
+}
+
+// 要素ごと演算の shape 規則。P4 で拡張:
+//   Tensor × Tensor:
+//     - ランク（次元数）が異なる → ElementwiseMismatch（Var を含む場合も常にエラー）
+//     - 同ランクで次元ごとにチェック:
+//         Concrete 不一致 → ElementwiseMismatch（P2 から）
+//         Var 名不一致   → VarConflict（P4 新規）
+//         それ以外（同値/同名/Unknown混在）→ OK、結果は lhs の shape
+//     - 全次元が OK なら Tensor(a) を返す（P4 改善: 以前は Unknown だった Var 同士の一致も
+//       正しく Tensor を返すようになった。例: Tensor[n]+Tensor[n] → Tensor[n]）
+//   Tensor × Scalar / Scalar × Tensor : ブロードキャスト（変わらず）
+//   Scalar × Scalar : Scalar
+//   それ以外: Unknown
 fn elementwise_shape(op: &'static str, l: ShapeType, r: ShapeType) -> Result<ShapeType, ShapeError> {
     match (l, r) {
         (ShapeType::Tensor(a), ShapeType::Tensor(b)) => {
-            match (all_concrete(&a), all_concrete(&b)) {
-                (Some(av), Some(bv)) => {
-                    if av != bv {
-                        Err(ShapeError::ElementwiseMismatch { op, a, b })
-                    } else {
-                        Ok(ShapeType::Tensor(a))
-                    }
-                }
-                // どちらかに Unknown 次元があれば一致/不一致を断定できない。
-                _ => Ok(ShapeType::Unknown),
+            // ランク不一致は Var を含む場合でも常にエラー。
+            // 理由: ランクは型注釈で明示的に宣言されるため、ランクが違えば確実に不整合。
+            if a.len() != b.len() {
+                return Err(ShapeError::ElementwiseMismatch { op, a, b });
             }
+            // 次元ごとに種別チェック。最初の衝突でエラーを返す。
+            for (da, db) in a.iter().zip(b.iter()) {
+                match dim_pair_conflict(da, db) {
+                    DimConflictKind::ConcreteMismatch => {
+                        return Err(ShapeError::ElementwiseMismatch { op, a, b })
+                    }
+                    DimConflictKind::VarMismatch(va, vb) => {
+                        return Err(ShapeError::VarConflict { op, var_a: va, var_b: vb })
+                    }
+                    DimConflictKind::Ok => {}
+                }
+            }
+            // 全次元が OK → lhs の shape を返す。
+            // P4 改善点: 以前は all_concrete が None なら Unknown を返していたが、
+            // Var 同士で名前が一致している場合（例: [n] と [n]）も Tensor を返すようになった。
+            Ok(ShapeType::Tensor(a))
         }
         (ShapeType::Tensor(d), ShapeType::Scalar) => Ok(ShapeType::Tensor(d)),
         (ShapeType::Scalar, ShapeType::Tensor(d)) => Ok(ShapeType::Tensor(d)),
@@ -1115,6 +1202,197 @@ f a b = a + b
 main = 1
 ";
         assert!(check(src).is_ok());
+    }
+
+    // ----- P4: 次元変数の単一化・shape 算術 -----
+    // P3 では Var 同士の比較は常に Unknown または「断定せず通す」だった。
+    // P4 では:
+    //   - 同名 Var 同士 → 一致（Tensor[n]+Tensor[n] → Tensor[n]）
+    //   - 異名 Var 同士 → VarConflict（Tensor[n]+Tensor[m] は潜在的不一致）
+    //   - 異なるランク → ElementwiseMismatch（Var を含む場合も常に）
+    //   - AnnotationMismatch: ランク不一致・Var 名不一致も対象に追加
+
+    #[test]
+    fn p4_var_conflict_elementwise() {
+        // n と m は独立な型変数（異なる名前 → 等しい保証なし）。
+        // Tensor[n] + Tensor[m] は型レベルで不整合なので VarConflict を報告する。
+        let src = "
+f : Tensor[n] -> Tensor[m] -> Tensor[n]
+f a b = a + b
+main = 1
+";
+        assert!(
+            matches!(check(src), Err(ShapeError::VarConflict { .. })),
+            "異名変数の elementwise は VarConflict を期待"
+        );
+    }
+
+    #[test]
+    fn p4_var_same_name_elementwise_ok() {
+        // 同名変数（n==n）→ 等しい次元が保証されるので通過し、結果は Tensor[n]。
+        // P3 では Unknown を返していた（all_concrete が None だったため）。
+        // P4 では dim_pair_conflict が Ok を返し、Tensor[n] を正しく伝播する。
+        let src = "
+f : Tensor[n] -> Tensor[n] -> Tensor[n]
+f a b = a + b
+main = 1
+";
+        assert!(check(src).is_ok(), "同名変数の elementwise は通過を期待");
+    }
+
+    #[test]
+    fn p4_var_same_name_result_shape() {
+        // 同名変数の elementwise が正しく Tensor[n] を返すことを確認する（P4 精度改善）。
+        // P3 では Unknown になっていた部分。
+        let src = "
+f : Tensor[n] -> Tensor[n] -> Tensor[n]
+f a b = a + b
+g : Tensor[3] -> Tensor[3]
+g v = f v v
+main = 1
+";
+        // g の本体: f v v = (Tensor[3]) + (Tensor[3]) → Tensor[3]
+        // 宣言戻り型 Tensor[3] と一致 → Ok
+        assert!(check(src).is_ok(), "Tensor[3] + Tensor[3] → Tensor[3] であるべき");
+    }
+
+    #[test]
+    fn p4_var_conflict_matmul_inner() {
+        // 行列積の内次元が異名変数（k と j）→ 独立型変数なので等しい保証がない → VarConflict。
+        // 正しい注釈は `Tensor[m,k] -> Tensor[k,n]`（共通名 k）にすべきである。
+        let src = "
+f : Tensor[m, k] -> Tensor[j, n] -> Tensor[m, n]
+f a b = a @ b
+main = 1
+";
+        assert!(
+            matches!(check(src), Err(ShapeError::VarConflict { op: "@", .. })),
+            "matmul 内次元の異名変数は VarConflict を期待"
+        );
+    }
+
+    #[test]
+    fn p4_var_matmul_inner_same_ok() {
+        // 内次元が同名変数（k==k）→ 一致が保証されるので通過。結果は [m,n]。
+        // P3 でも通っていたが、P4 で VarConflict の対称性を確認するためテストを追加。
+        let src = "
+f : Tensor[m, k] -> Tensor[k, n] -> Tensor[m, n]
+f a b = a @ b
+main = 1
+";
+        assert!(check(src).is_ok(), "内次元同名変数の matmul は通過を期待");
+    }
+
+    #[test]
+    fn p4_rank_mismatch_always_errors() {
+        // ランクが異なるテンソルの加算は、次元変数を含む場合でも常にエラー。
+        // P3 では Var が絡むと Unknown を返して見逃していた。
+        let src = "
+f : Tensor[n] -> Tensor[n, m] -> Tensor[n]
+f a b = a + b
+main = 1
+";
+        assert!(
+            matches!(check(src), Err(ShapeError::ElementwiseMismatch { .. })),
+            "ランク不一致は常に ElementwiseMismatch を期待"
+        );
+    }
+
+    #[test]
+    fn p4_annotation_rank_mismatch() {
+        // 宣言戻り型のランクと本体推論のランクが異なる → AnnotationMismatch（P4 拡張）。
+        // f : Tensor[n] -> Tensor[n,n] と宣言しているが本体は Tensor[n]（1D）を返す。
+        let src = "
+f : Tensor[n] -> Tensor[n, n]
+f a = a
+main = 1
+";
+        assert!(
+            matches!(check(src), Err(ShapeError::AnnotationMismatch { .. })),
+            "ランク不一致の戻り型は AnnotationMismatch を期待"
+        );
+    }
+
+    #[test]
+    fn p4_annotation_var_name_mismatch() {
+        // 宣言戻り型 Tensor[m] vs 本体推論 Tensor[n]（変数名が異なる）→ AnnotationMismatch。
+        // n と m は独立変数なので、`f : Tensor[n] -> Tensor[m]` で `f a = a` は矛盾する。
+        let src = "
+f : Tensor[n] -> Tensor[m]
+f a = a
+main = 1
+";
+        assert!(
+            matches!(check(src), Err(ShapeError::AnnotationMismatch { .. })),
+            "変数名不一致の戻り型は AnnotationMismatch を期待"
+        );
+    }
+
+    #[test]
+    fn p4_annotation_var_name_same_ok() {
+        // 宣言戻り型 Tensor[n] vs 本体推論 Tensor[n]（同名）→ Ok（P4 精度改善）。
+        // P3 では all_concrete が None なので通っていたが、理由が曖昧だった。
+        // P4 では dim_pair_conflict が Ok (同名) を返すので明示的に通る。
+        let src = "
+f : Tensor[n] -> Tensor[n]
+f a = a
+main = 1
+";
+        assert!(check(src).is_ok(), "同名変数戻り型は通過を期待");
+    }
+
+    #[test]
+    fn p4_shape_arithmetic_parses_and_no_false_positive() {
+        // shape 算術（m+n, m*n）が型注釈に書けて、偽陽性なく通ることを確認する。
+        // concat/flatten 等の算術プリミティブは未実装なので、算術次元は Unknown として
+        // 扱われる。これにより戻り型の突き合わせで矛盾が断定されず通過する。
+        //
+        // 本体は Unknown/Scalar を返す例を使い、ランク不一致の誤検出が起きないことを示す:
+        //   concat a b = a : 引数 Tensor[m] と戻り Tensor[Unknown] は同ランク（rank 1）
+        //   sliding a = a  : 引数 Tensor[Unknown]（m+n を 1 次元と見る）と戻り Tensor[m] は同ランク
+        // なお flatten : Tensor[m,n] -> Tensor[m*n] は体が rank-2 を返し宣言戻り rank-1 なので
+        // ランク不一致（AnnotationMismatch）になる―これは正しい挙動（本体が間違っている）。
+        let src = "
+concat : Tensor[m] -> Tensor[n] -> Tensor[m+n]
+concat a b = a
+sliding : Tensor[m+n] -> Tensor[m+n]
+sliding a = a
+main = 1
+";
+        assert!(check(src).is_ok(), "shape 算術注釈は偽陽性なく通過を期待");
+    }
+
+    #[test]
+    fn p4_shape_arithmetic_flatten_rank_mismatch() {
+        // flatten : Tensor[m,n] -> Tensor[m*n] は rank-2 引数を受け取り rank-1 を返す。
+        // 本体 `flatten a = a` は rank-2 の a をそのまま返すため rank 不一致 → AnnotationMismatch。
+        // これは P4 のランク検査が正当に型エラーを検出する例（偽陰性ゼロの確認）。
+        let src = "
+flatten : Tensor[m, n] -> Tensor[m*n]
+flatten a = a
+main = 1
+";
+        assert!(
+            matches!(check(src), Err(ShapeError::AnnotationMismatch { .. })),
+            "rank-2 本体と rank-1 宣言戻り型は AnnotationMismatch を期待"
+        );
+    }
+
+    #[test]
+    fn p4_shape_arithmetic_complex_expr() {
+        // 複合算術式（m+1, m+n-1）がパースエラーなく通ることを確認する。
+        // AST に DimExpr として保持されることが目的。
+        // 本体と宣言のランクを揃えて偽陽性が出ないことも確認する:
+        //   shift : Tensor[m] -> Tensor[m+1] : rank-1 in, rank-1 out (Unknown). body 返り Unknown.
+        //   clip  : Tensor[m+n-1] -> Tensor[m+n-1] : rank-1 in/out. body そのまま返す。
+        let src = "
+shift : Tensor[m] -> Tensor[m+1]
+shift a = zeros [1]
+clip : Tensor[m+n-1] -> Tensor[m+n-1]
+clip a = a
+main = 1
+";
+        assert!(check(src).is_ok(), "複合 shape 算術式は通過を期待");
     }
 
     #[test]
