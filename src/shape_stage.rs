@@ -616,6 +616,14 @@ fn load_builtins(env: ShapeEnv) -> ShapeEnv {
         ("reshape", BuiltinFn::Reshape),
         ("grad", BuiltinFn::Grad),
         ("iterate", BuiltinFn::Iterate),
+        // P6 標準ライブラリ
+        ("abs", BuiltinFn::Abs),
+        ("max_val", BuiltinFn::MaxVal),
+        ("min_val", BuiltinFn::MinVal),
+        ("concat", BuiltinFn::Concat),
+        ("flatten", BuiltinFn::Flatten),
+        ("norm", BuiltinFn::Norm),
+        ("clip", BuiltinFn::Clip),
     ];
     for (name, f) in builtins {
         env.define_global(name.to_string(), ShapeType::Builtin(*f));
@@ -821,16 +829,6 @@ fn elementwise_shape(op: &'static str, l: ShapeType, r: ShapeType) -> Result<Sha
     }
 }
 
-// すべての次元が Concrete なら usize の列を返す（完全に確定した shape）。
-// 一つでも Var/Unknown があれば None。比較できるのは完全 Concrete 同士だけ。
-fn all_concrete(dims: &[DimVal]) -> Option<Vec<usize>> {
-    dims.iter()
-        .map(|d| match d {
-            DimVal::Concrete(n) => Some(*n),
-            _ => None,
-        })
-        .collect()
-}
 
 // 関数適用の shape 規則。interpreter::apply の鏡像。
 fn apply_shape(f: ShapeType, arg: ShapeType) -> Result<ShapeType, ShapeError> {
@@ -928,6 +926,49 @@ fn apply_shape_builtin(b: BuiltinFn, args: Vec<ShapeType>) -> Result<ShapeType, 
             apply_shape(f, init.clone())?;
             Ok(init)
         }
+
+        // P6 標準ライブラリの shape 規則
+        // abs: 入力と同じ shape（スカラー→スカラー、テンソル→同 shape）。
+        BuiltinFn::Abs => Ok(args[0].clone()),
+
+        // max_val / min_val: 集約なのでスカラーを返す（sum/mean と同じ規則）。
+        BuiltinFn::MaxVal | BuiltinFn::MinVal => Ok(ShapeType::Scalar),
+
+        // concat a b: 両辺が 1D テンソルなら長さを足した 1D テンソルを返す。
+        // P6 shape 算術の最初の実例: Tensor[m] と Tensor[n] → Tensor[m+n]。
+        // 両辺のランクが 1 でない場合、または次元が Unknown/Var の場合は Unknown。
+        // Concrete(m) + Concrete(n) のときだけ Concrete(m+n) を確定できる（偽陽性ゼロ）。
+        BuiltinFn::Concat => match (&args[0], &args[1]) {
+            (ShapeType::Tensor(a), ShapeType::Tensor(b)) if a.len() == 1 && b.len() == 1 => {
+                match (&a[0], &b[0]) {
+                    (DimVal::Concrete(m), DimVal::Concrete(n)) => {
+                        Ok(ShapeType::Tensor(vec![DimVal::Concrete(m + n)]))
+                    }
+                    // 片方でも Var/Unknown なら合計サイズを断定できない。
+                    _ => Ok(ShapeType::Unknown),
+                }
+            }
+            _ => Ok(ShapeType::Unknown),
+        },
+
+        // flatten t: 2D テンソルを 1D に展開する。Tensor[m,n] → Tensor[m*n]。
+        // 両次元が Concrete のときだけ積を確定できる（偽陽性ゼロ）。
+        BuiltinFn::Flatten => match &args[0] {
+            ShapeType::Tensor(d) if d.len() == 2 => match (&d[0], &d[1]) {
+                (DimVal::Concrete(m), DimVal::Concrete(n)) => {
+                    Ok(ShapeType::Tensor(vec![DimVal::Concrete(m * n)]))
+                }
+                _ => Ok(ShapeType::Unknown),
+            },
+            _ => Ok(ShapeType::Unknown),
+        },
+
+        // norm: L2 ノルムはスカラー。
+        BuiltinFn::Norm => Ok(ShapeType::Scalar),
+
+        // clip lo hi t: テンソルの shape を保持する（要素変換のみ）。
+        // args = [lo, hi, t]。t の shape をそのまま返す。
+        BuiltinFn::Clip => Ok(args[2].clone()),
     }
 }
 
@@ -1644,6 +1685,95 @@ main = 1
         // 戻り型 Tensor[n*2] は subst 無しで Unknown → check_annotation はスキップ（偽陽性なし）。
         // このテストでは偽陽性が起きないことを確認する。
         assert!(check(src).is_ok(), "戻り算術式は subst 無しなら Unknown → スキップ（偽陽性なし）");
+    }
+
+    // ----- P6: 標準ライブラリの shape 規則 -----
+    // abs/max_val/min_val/concat/flatten/norm/clip が shape ドメインで正しく動くことを確認する。
+
+    #[test]
+    fn p6_abs_shape_preserved() {
+        // abs はテンソルの shape を保持する（Tensor[3] → Tensor[3]）。
+        match check("main = abs [1.0, -2.0, 3.0]") {
+            Ok(ShapeType::Tensor(d)) => assert_eq!(d, vec![DimVal::Concrete(3)]),
+            other => panic!("Tensor[3] を期待: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p6_max_val_min_val_scalar() {
+        // max_val / min_val は集約してスカラーを返す。
+        assert!(matches!(
+            check("main = max_val [1.0, 2.0, 3.0]"),
+            Ok(ShapeType::Scalar)
+        ));
+        assert!(matches!(
+            check("main = min_val [1.0, 2.0, 3.0]"),
+            Ok(ShapeType::Scalar)
+        ));
+    }
+
+    #[test]
+    fn p6_concat_concrete_shape() {
+        // concat a b: 両辺が Concrete 1D なら m+n を確定できる。
+        // [1,2]（長さ2）と [3,4,5]（長さ3）を連結 → Tensor[5]。
+        let src = "main = concat [1.0, 2.0] [3.0, 4.0, 5.0]";
+        match check(src) {
+            Ok(ShapeType::Tensor(d)) => assert_eq!(d, vec![DimVal::Concrete(5)]),
+            other => panic!("Tensor[5] を期待: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p6_concat_var_shape_unknown() {
+        // 次元変数を含む場合は合計サイズを断定できないので Unknown（偽陽性ゼロ）。
+        let src = "
+f : Tensor[m] -> Tensor[n] -> Tensor[m+n]
+f a b = concat a b
+main = 1
+";
+        // concat a b は Tensor[Var(m)] と Tensor[Var(n)] → Unknown（Var のため）
+        // 戻り型 Tensor[Unknown]（m+n は算術次元）と Unknown は照合スキップ → Ok
+        assert!(check(src).is_ok(), "変数次元の concat は偽陽性なし");
+    }
+
+    #[test]
+    fn p6_flatten_concrete_shape() {
+        // flatten: 2D テンソル Tensor[2,3] → Tensor[6]（2*3=6）。
+        let src = "main = flatten [1.0, 2.0, 3.0; 4.0, 5.0, 6.0]";
+        match check(src) {
+            Ok(ShapeType::Tensor(d)) => assert_eq!(d, vec![DimVal::Concrete(6)]),
+            other => panic!("Tensor[6] を期待: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p6_norm_scalar() {
+        // norm はスカラーを返す。
+        assert!(matches!(
+            check("main = norm [3.0, 4.0]"),
+            Ok(ShapeType::Scalar)
+        ));
+    }
+
+    #[test]
+    fn p6_clip_shape_preserved() {
+        // clip lo hi t: テンソルの shape を保持する（Tensor[4] → Tensor[4]）。
+        let src = "main = clip 0.0 1.0 [0.5, 1.5, -0.5, 0.8]";
+        match check(src) {
+            Ok(ShapeType::Tensor(d)) => assert_eq!(d, vec![DimVal::Concrete(4)]),
+            other => panic!("Tensor[4] を期待: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p6_concat_downstream_mismatch() {
+        // concat の具体 shape が伝播することで、下流の不整合を検出できる。
+        // concat [1] [2,3] → Tensor[3]。これと [1,2] の加算は [3]+[2] で不一致。
+        let src = "main = concat [1.0] [2.0, 3.0] + [1.0, 2.0]";
+        assert!(
+            matches!(check(src), Err(ShapeError::ElementwiseMismatch { .. })),
+            "concat 結果[3] + [2] は ElementwiseMismatch を期待"
+        );
     }
 
     #[test]

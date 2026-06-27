@@ -12,7 +12,7 @@ dependent 型は研究レベルなので段階導入する。
 | P3 ✅ | shape 検査を型に導入（固定次元） | 静的 shape |
 | **P4 ✅** | **shape 多態（次元変数の単一化）＋ shape 算術** | **多相 shape** |
 | **P5 ✅** | **値依存 shape（DimList・zeros/ones/reshape の具体 shape 推論・置換評価）** | **dependent（部分）** |
-| P6 | レイアウトの厳密化・エラー改善・標準ライブラリ | — |
+| **P6 ✅** | **標準ライブラリ拡充（abs/max_val/min_val/concat/flatten/norm/clip）・エラー改善・concat/flatten shape 推論** | **—** |
 
 P0〜P4 で既に実用的かつ十分意欲的。P5 を最終目標に置きつつ手前で価値を出す。
 
@@ -38,6 +38,40 @@ P0〜P4 で既に実用的かつ十分意欲的。P5 を最終目標に置きつ
 
 P2 では固定次元（`Concrete` のみ）を対象とし、次元変数の単一化は P4 で導入する。
 staging pass の構造を P2 で確立することで、P4 では単一化アルゴリズムを追加するだけでよい。
+
+### P6：標準ライブラリ拡充・エラー改善・concat/flatten shape 推論の詳細 ✅ 実装済み
+
+**新組み込み関数（`value.rs` / `interpreter.rs` / `shape_stage.rs`）**
+
+| 関数 | シグネチャ（概念） | shape 規則 |
+|------|-------------------|------------|
+| `abs` | `a -> a` | 入力と同 shape |
+| `max_val` | `Tensor[...] -> f32` | スカラー（集約） |
+| `min_val` | `Tensor[...] -> f32` | スカラー（集約） |
+| `concat` | `Tensor[m] -> Tensor[n] -> Tensor[m+n]` | Concrete 時 m+n を確定 |
+| `flatten` | `Tensor[m,n] -> Tensor[m*n]` | Concrete 時 m*n を確定 |
+| `norm` | `Tensor[...] -> f32` | スカラー（L2 ノルム） |
+| `clip` | `f32 -> f32 -> Tensor[...] -> Tensor[...]` | 入力と同 shape |
+
+**shape 算術の実動作（P6 の中核）**
+
+`concat` / `flatten` の shape 規則を `apply_shape_builtin` に実装したことで、
+P4 で AST に持たせるだけだった shape 算術（`m+n`, `m*n`）が初めて実際の推論で使われるようになった:
+
+- `concat [1,2] [3,4,5]` → `Tensor[2] concat Tensor[3]` → `Tensor[5]`（2+3=5 を確定）
+- `flatten [[1,2,3],[4,5,6]]` → `Tensor[2,3]` → `Tensor[6]`（2*3=6 を確定）
+
+Concrete でない場合（Var/Unknown が絡む）は Unknown にフォールバックして偽陽性ゼロを維持する。
+
+**エラーメッセージ改善**
+
+- `HaploError::Shape` の `Display` に「ヒント」行を追加（型注釈の見直しを促す）
+- CLI エラー出力を `error[ファイル名]: ...` 形式に統一（IDE からのジャンプを想定）
+- 未使用の `all_concrete` ヘルパを削除（P4 の `dim_pair_conflict` 移行で不要になった）
+
+**サンプル追加: `examples/stdlib_showcase.hpl`**
+
+新組み込み関数 7 本の組み合わせ例。`abs → clip → norm` のパイプラインで信号を正規化する。
 
 ### P5：値依存 shape（DimList・置換評価）の詳細 ✅ 実装済み
 

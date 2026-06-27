@@ -16,7 +16,7 @@ use value::Value;
 // 代替: anyhow や thiserror クレートを使う方法があるが、
 // 外部依存を最小にするために手書きを選んだ。P0 のエラー種類は少ないので手間は小さい。
 #[derive(Debug)]
-enum HaploError {
+pub(crate) enum HaploError {
     Lex(lexer::LexError),
     Parse(parser::ParseError),
     Shape(shape_stage::ShapeError),
@@ -27,11 +27,13 @@ enum HaploError {
 impl std::fmt::Display for HaploError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HaploError::Lex(e) => write!(f, "字句解析エラー: {}", e),
-            HaploError::Parse(e) => write!(f, "構文解析エラー: {}", e),
-            HaploError::Shape(e) => write!(f, "shape 検査エラー: {}", e),
-            HaploError::Eval(e) => write!(f, "評価エラー: {}", e),
-            HaploError::Io(e) => write!(f, "IO エラー: {}", e),
+            HaploError::Lex(e) => write!(f, "[字句解析] {}", e),
+            HaploError::Parse(e) => write!(f, "[構文解析] {}", e),
+            // Shape エラーは種別ごとにヒントを添える（P6 改善）。
+            // どのフェーズで検出されたかが明示されることで、ユーザが修正箇所を絞りやすくなる。
+            HaploError::Shape(e) => write!(f, "[shape 検査] {}\n  ヒント: 型注釈を確認するか、テンソルの次元数・サイズを見直してください", e),
+            HaploError::Eval(e) => write!(f, "[実行時] {}", e),
+            HaploError::Io(e) => write!(f, "[IO] {}", e),
         }
     }
 }
@@ -69,7 +71,7 @@ impl From<std::io::Error> for HaploError {
 // （行列積の内次元不一致・要素ごと演算の shape 不一致）を静的に検出して弾く。
 // shape を推論できない箇所は Unknown を伝播させ、正しいプログラムは素通しする
 // （偽陽性ゼロ方針）。? 演算子で各段のエラーを HaploError に変換しながら伝播させる。
-pub fn run(source: &str) -> Result<Value, HaploError> {
+pub(crate) fn run(source: &str) -> Result<Value, HaploError> {
     let tokens = lexer::lex(source)?;
     let program = parser::parse(&tokens)?;
     shape_stage::shape_eval_program(&program)?;
@@ -94,7 +96,10 @@ fn main() {
     match result {
         Ok(val) => println!("{}", val),
         Err(e) => {
-            eprintln!("エラー: {}", e);
+            // ファイル名が分かるとき（args[1]）はエラー行に含める（P6 改善）。
+            // "error[file.hpl]: ..." の形式で出力することで、IDE・エディタからジャンプできる。
+            let file = args.get(1).map(|s| s.as_str()).unwrap_or("<stdin>");
+            eprintln!("error[{}]: {}", file, e);
             std::process::exit(1);
         }
     }

@@ -1,0 +1,32 @@
+-- P6 標準ライブラリのショーケース
+-- 使用: abs / max_val / min_val / concat / flatten / norm / clip
+
+-- abs: 要素ごとの絶対値
+raw = [-1.0, 2.0, -3.0, 4.0]
+magnitudes = abs raw
+
+-- max_val / min_val: テンソル全体の最大・最小を集約してスカラーを返す
+lo = min_val magnitudes
+hi = max_val magnitudes
+
+-- concat: 2 つの 1D テンソルを連結して長さ m+n のテンソルを作る
+prefix = [10.0, 20.0]
+suffix = [30.0, 40.0, 50.0]
+joined = concat prefix suffix   -- Tensor[5]
+
+-- flatten: 2D テンソルを 1D に展開する（行優先、m*n 要素）
+grid = [1.0, 2.0, 3.0;
+        4.0, 5.0, 6.0]
+flat = flatten grid              -- Tensor[6]
+
+-- norm: L2 ノルム（sqrt( sum(t^2) )）
+v = [3.0, 4.0]
+v_norm = norm v                 -- 5.0
+
+-- clip: 値域を [lo, hi] に制限する（活性化関数の前処理等で使う）
+logits = [-2.0, 0.5, 1.5, 3.0]
+clamped = clip 0.0 1.0 logits   -- [0.0, 0.5, 1.0, 1.0]
+
+-- 組み合わせ例: abs → clip → norm のパイプラインで正規化
+signal = [-0.5, 1.2, -0.3, 0.8]
+main = norm (clip 0.0 1.0 (abs signal))
