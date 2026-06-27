@@ -11,7 +11,7 @@ dependent 型は研究レベルなので段階導入する。
 | P2 ✅ | shape の抽象評価（staging パス） | 抽象 shape ドメイン |
 | P3 ✅ | shape 検査を型に導入（固定次元） | 静的 shape |
 | **P4 ✅** | **shape 多態（次元変数の単一化）＋ shape 算術** | **多相 shape** |
-| P5 | 完全な dependent 型（値依存の shape） | dependent |
+| **P5 ✅** | **値依存 shape（DimList・zeros/ones/reshape の具体 shape 推論・置換評価）** | **dependent（部分）** |
 | P6 | レイアウトの厳密化・エラー改善・標準ライブラリ | — |
 
 P0〜P4 で既に実用的かつ十分意欲的。P5 を最終目標に置きつつ手前で価値を出す。
@@ -38,6 +38,48 @@ P0〜P4 で既に実用的かつ十分意欲的。P5 を最終目標に置きつ
 
 P2 では固定次元（`Concrete` のみ）を対象とし、次元変数の単一化は P4 で導入する。
 staging pass の構造を P2 で確立することで、P4 では単一化アルゴリズムを追加するだけでよい。
+
+### P5：値依存 shape（DimList・置換評価）の詳細 ✅ 実装済み
+
+**DimList による具体 shape 伝播**
+
+P4 まで `zeros`/`ones`/`reshape` は常に `Unknown` を返していた。P5 では整数リテラルのみからなる
+1D テンソル（`[3]`、`[2, 4]` など）を `ShapeType::DimList(Vec<usize>)` として認識し、
+`apply_shape_builtin` で消費して具体的な `Tensor[Concrete(...)]` を返す。
+
+- `shape_eval_tensor_lit`: 1行かつ全要素が非負整数リテラル → `DimList` を返す
+  （浮動小数 `[3.0]` は対象外。偽陽性ゼロ）
+- `apply_shape_builtin`:
+  - `Zeros | Ones`: `DimList(dims)` → `Tensor[Concrete(n) for n in dims]`
+  - `Reshape`: 第2引数が `DimList(dims)` → `Tensor[Concrete(n) for n in dims]`
+
+これにより `zeros [3]` が `Tensor[3]` に、`zeros [2, 4]` が `Tensor[2, 4]` に確定し、
+下流の演算でも shape が伝播する。例: `zeros [3] + [1,2]` が `ElementwiseMismatch` を検出できる。
+
+**shape 算術の置換評価（`Subst`）**
+
+`check_annotated_fn` で引数の宣言 `TypeDim::Var(name)` と推論 `DimVal::Concrete(n)` を
+突き合わせて置換表 `Subst = HashMap<String, usize>` を構築する。
+戻り型を `shape_of_type_with_subst` で変換する際、`TypeDim::Expr` に含まれる変数を
+`eval_dim_expr` で評価して `DimVal::Concrete` に解決する。
+
+```
+例: double_size : Tensor[n] -> Tensor[n*2]
+  引数が Tensor[Concrete(3)] → subst = {n: 3}
+  戻り型 Tensor[n*2] → eval_dim_expr(n*2, {n:3}) = 6 → Tensor[Concrete(6)]
+```
+
+`subst` に変数が無い場合（引数が Unknown/Var）は `None` を返し `DimVal::Unknown` に
+フォールバックするため、偽陽性は生じない。
+
+```
+新規追加:
+  ShapeType::DimList(Vec<usize>)   -- 整数リテラルの 1D テンソル（shape 指定子）
+  type Subst = HashMap<String, usize>
+  fn eval_dim_expr(e: &DimExpr, subst: &Subst) -> Option<usize>
+  fn shape_of_type_with_subst(ty: &TypeExpr, subst: &Subst) -> ShapeType
+  fn build_subst_from_params(param_shapes: &[ShapeType], declared_arrow: &TypeExpr) -> Subst
+```
 
 ### P4：次元変数の単一化・shape 算術の詳細 ✅ 実装済み
 

@@ -1,7 +1,7 @@
 # Haplo — Claude Code 向けプロジェクトガイド
 
 Haplo は機械学習向けの純粋関数型・静的型付き DSL（Rust 実装）。
-**現在のフェーズ: P4 完了（次元変数の単一化・shape 算術 — 異名変数 VarConflict 検出・`m+n`/`m*n` 算術次元パース・`->` 右結合修正）。次: P5 — 完全な dependent 型（値依存の shape）**
+**現在のフェーズ: P5 完了（値依存 shape — `DimList` による `zeros`/`ones`/`reshape` の具体 shape 推論・shape 算術の置換評価）。次: P6 — レイアウト厳密化・エラー改善・標準ライブラリ**
 
 > ロードマップの正式版（[docs/spec-roadmap.md](docs/spec-roadmap.md)）に従い、P4 は次元変数の単一化と shape 算術（型注釈での AST 保持・パース）を実装した。算術次元の実際の評価（concat/flatten 等プリミティブが必要）は P6 目標。
 

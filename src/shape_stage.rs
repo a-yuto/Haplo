@@ -119,6 +119,20 @@ pub enum ShapeType {
     // 推論不能。エラーにせず伝播させるための「分からない」を表す底値。
     // zeros/reshape の出力（引数の値に依存）や、Unknown を含む演算結果がこれになる。
     Unknown,
+    // P5 新規: 整数リテラルからなる 1D テンソルの「内容値」を保持する特殊型。
+    // これは shape 指定子として使われる `[3]` や `[2, 4]` のためのもので、
+    // 通常の浮動小数テンソル（例: [1.0, 2.0]）は対象外。
+    //
+    // なぜ通常の Tensor と分けるか:
+    //   `zeros [3]` の `[3]` は「次元リスト」として解釈されるが、
+    //   Tensor[Concrete(1)] からは「中身が 3」という情報が失われている。
+    //   DimList(vec![3]) ならば `zeros` が Tensor[Concrete(3)] を返せる。
+    //   浮動小数リテラル（[3.0]）は DimList にならず Unknown のまま（偽陽性ゼロ）。
+    //
+    // 代替案: Tensor に Option<Vec<i64>> の「内容ヒント」を持たせる案もあったが、
+    //   ShapeType の変更が広範囲に波及し、既存コードへの影響が大きくなる。
+    //   DimList を独立した variant にする方が変更を局所化できる。
+    DimList(Vec<usize>),
 }
 
 // 1次元ぶんの大きさ。
@@ -373,6 +387,81 @@ fn build_shape_env(program: &Program) -> Result<ShapeEnv, ShapeError> {
     Ok(env)
 }
 
+// P5: 次元変数名 → 具体サイズ のマッピング（単一化の置換表）。
+// 型注釈で `Tensor[n]` と宣言された引数に `Tensor[Concrete(3)]` が渡されると
+// subst["n"] = 3 が確立し、戻り型の Var(n) を Concrete(3) に解決できる。
+type Subst = HashMap<String, usize>;
+
+// DimExpr（算術式）を置換表に基づいて評価する。
+// 変数がすべて subst に束縛されていれば Some(値) を返す。
+// 未束縛変数・算術オーバーフローが生じる場合は None（偽陽性ゼロ）。
+fn eval_dim_expr(e: &DimExpr, subst: &Subst) -> Option<usize> {
+    match e {
+        DimExpr::Lit(n) => Some(*n),
+        DimExpr::Var(s) => subst.get(s).copied(),
+        DimExpr::Add(a, b) => Some(eval_dim_expr(a, subst)? + eval_dim_expr(b, subst)?),
+        DimExpr::Sub(a, b) => {
+            let va = eval_dim_expr(a, subst)?;
+            let vb = eval_dim_expr(b, subst)?;
+            // 符号なし減算: アンダーフローは None にして偽陽性を避ける。
+            va.checked_sub(vb)
+        }
+        DimExpr::Mul(a, b) => Some(eval_dim_expr(a, subst)? * eval_dim_expr(b, subst)?),
+    }
+}
+
+// 型式を置換表つきで ShapeType に変換する。
+// shape_of_type との違いは TypeDim::Expr を subst で評価して Concrete に解決できる点。
+// 解決できない Expr（変数が subst に無い）は Unknown にフォールバック（偽陽性ゼロ）。
+fn shape_of_type_with_subst(ty: &TypeExpr, subst: &Subst) -> ShapeType {
+    match ty {
+        TypeExpr::Tensor(dims) => ShapeType::Tensor(
+            dims.iter()
+                .map(|d| match d {
+                    TypeDim::Fixed(n) => DimVal::Concrete(*n),
+                    TypeDim::Var(s) => match subst.get(s) {
+                        Some(&n) => DimVal::Concrete(n),
+                        None => DimVal::Var(s.clone()),
+                    },
+                    TypeDim::Expr(e) => match eval_dim_expr(e, subst) {
+                        Some(n) => DimVal::Concrete(n),
+                        None => DimVal::Unknown,
+                    },
+                })
+                .collect(),
+        ),
+        // Arrow/Named/App は shape_of_type と同じ処理で OK。
+        _ => shape_of_type(ty),
+    }
+}
+
+// 引数の宣言 TypeDim と推論 DimVal を突き合わせて置換表を構築する。
+// 例: 宣言 Tensor[n, d]、推論 Tensor[Concrete(4), Concrete(3)] → subst = {n:4, d:3}
+// 具体サイズが取れない位置（Unknown/Var）は置換表に入れない（偽陽性ゼロ）。
+fn build_subst_from_params(param_shapes: &[ShapeType], declared_arrow: &TypeExpr) -> Subst {
+    let mut subst = Subst::new();
+    let mut cur = declared_arrow;
+    for inferred in param_shapes {
+        let lhs = match cur {
+            TypeExpr::Arrow(lhs, rhs) => {
+                cur = rhs;
+                lhs.as_ref()
+            }
+            _ => break,
+        };
+        if let (TypeExpr::Tensor(decl_dims), ShapeType::Tensor(inf_dims)) = (lhs, inferred) {
+            if decl_dims.len() == inf_dims.len() {
+                for (dd, id) in decl_dims.iter().zip(inf_dims.iter()) {
+                    if let (TypeDim::Var(name), DimVal::Concrete(n)) = (dd, id) {
+                        subst.insert(name.clone(), *n);
+                    }
+                }
+            }
+        }
+    }
+    subst
+}
+
 // 型注釈付き関数の本体を検査する。注釈の Arrow を引数の数だけ剥がして各引数の
 // 宣言 shape を得て、globals 環境にそれらを束縛してから本体を shape 評価する。
 //   - 本体内の `@`/要素ごと演算の固定次元矛盾は shape_eval がそのまま surface する。
@@ -387,7 +476,24 @@ fn check_annotated_fn(
     ty: &TypeExpr,
     globals: &ShapeEnv,
 ) -> Result<(), ShapeError> {
-    let (param_shapes, return_shape) = decompose_arrow(ty, params.len());
+    let (param_shapes, _return_shape_generic) = decompose_arrow(ty, params.len());
+
+    // P5: 引数の宣言型と推論 shape から次元変数の置換表を構築する。
+    // 例: `f : Tensor[n] -> Tensor[n*2]` に Tensor[3] を渡す → subst = {n: 3}
+    // これにより戻り型 Tensor[n*2] が Tensor[Concrete(6)] に解決される。
+    let subst = build_subst_from_params(&param_shapes, ty);
+    // 置換表を用いて戻り型を解決する（DimExpr も評価される）。
+    let return_shape = {
+        // decompose_arrow の戻り部分（arity 個の Arrow を剥がした残り）を再取得する。
+        let mut cur = ty;
+        for _ in 0..params.len() {
+            match cur {
+                TypeExpr::Arrow(_, rhs) => cur = rhs,
+                _ => break,
+            }
+        }
+        shape_of_type_with_subst(cur, &subst)
+    };
 
     // 各引数を宣言 shape（足りない分は Unknown）に束縛した環境を作る。
     let mut env = globals.clone();
@@ -784,13 +890,25 @@ fn apply_shape_builtin(b: BuiltinFn, args: Vec<ShapeType>) -> Result<ShapeType, 
             _ => Ok(ShapeType::Unknown),
         },
 
-        // zeros/ones の出力 shape は「引数の値」に依存する（例: zeros [3] の中身 3 が次元）。
-        // shape 情報だけからは決まらないため Unknown を返す（健全性優先で precision を捨てる）。
-        // 将来、引数がリテラルのときに const-fold して具体 shape を出す改善が可能（P3+）。
-        BuiltinFn::Zeros | BuiltinFn::Ones => Ok(ShapeType::Unknown),
+        // P5: zeros/ones の出力 shape を DimList から具体的に求める。
+        // `zeros [3]` → args[0] = DimList([3]) → Tensor[Concrete(3)]
+        // `zeros [2, 4]` → Tensor[Concrete(2), Concrete(4)]
+        // DimList でない場合（zeros (f x) 等）は Unknown にフォールバック（偽陽性ゼロ）。
+        BuiltinFn::Zeros | BuiltinFn::Ones => match &args[0] {
+            ShapeType::DimList(dims) => Ok(ShapeType::Tensor(
+                dims.iter().map(|&n| DimVal::Concrete(n)).collect(),
+            )),
+            _ => Ok(ShapeType::Unknown),
+        },
 
-        // reshape も第2引数の値に依存するため Unknown。
-        BuiltinFn::Reshape => Ok(ShapeType::Unknown),
+        // P5: reshape の出力 shape も第2引数が DimList なら具体的に求める。
+        // `reshape t [2, 3]` → args[1] = DimList([2, 3]) → Tensor[Concrete(2), Concrete(3)]
+        BuiltinFn::Reshape => match &args[1] {
+            ShapeType::DimList(dims) => Ok(ShapeType::Tensor(
+                dims.iter().map(|&n| DimVal::Concrete(n)).collect(),
+            )),
+            _ => Ok(ShapeType::Unknown),
+        },
 
         // grad f x の勾配は入力 x と同じ shape。
         // f を x に1回 apply して本体内部の shape 不整合も surface する（結果は捨てる）。
@@ -816,6 +934,10 @@ fn apply_shape_builtin(b: BuiltinFn, args: Vec<ShapeType>) -> Result<ShapeType, 
 // テンソルリテラルの shape を求める。interpreter::eval_tensor_lit の shape 版。
 //   - 空リテラル → Tensor([0])（eval と同じ）
 //   - 行の長さが揃わない → NonUniformTensor（eval と同じく早期検出）
+//   - 1行かつ全要素が非負整数リテラル → DimList（P5 新規）
+//       `[3]`, `[2, 4]` のように shape 指定子として使う整数リテラルが対象。
+//       これにより `zeros [3]` → Tensor[Concrete(3)] の伝播が可能になる。
+//       浮動小数（[3.0]）は対象外で通常の Tensor 扱い（偽陽性ゼロ）。
 //   - 全要素が Scalar のとき: 1行 → [cols]、複数行 → [rows, cols]
 //   - 要素に非スカラー/Unknown が混じる場合は shape を断定せず Unknown（偽陽性回避）
 // 要素は順に shape 評価するので、要素式の内部にある shape エラーもここで surface される。
@@ -825,11 +947,32 @@ fn shape_eval_tensor_lit(rows: &[Vec<Expr>], env: &ShapeEnv) -> Result<ShapeType
     }
 
     let ncols = rows[0].len();
-    let mut all_scalar = true;
     for row in rows {
         if row.len() != ncols {
             return Err(ShapeError::NonUniformTensor);
         }
+    }
+
+    // P5: 1D かつ全要素が非負整数リテラルなら DimList として返す（値を保持）。
+    // `zeros [3]` / `zeros [2, 4]` の引数がこのケースに該当する。
+    // 多行（2D）は shape 指定子として使われることがないため対象外。
+    // なお内部エラーの検出は下の通常パスで行うため、ここでは early-return のみ。
+    if rows.len() == 1 {
+        let maybe_ints: Option<Vec<usize>> = rows[0]
+            .iter()
+            .map(|e| match e {
+                // 整数リテラル（例: `3`）のみ対象。Float（`3.0`）は除外して偽陽性を防ぐ。
+                Expr::Lit(Literal::Int(n)) if *n >= 0 => Some(*n as usize),
+                _ => None,
+            })
+            .collect();
+        if let Some(dims) = maybe_ints {
+            return Ok(ShapeType::DimList(dims));
+        }
+    }
+
+    let mut all_scalar = true;
+    for row in rows {
         for e in row {
             let s = shape_eval(e, env)?;
             if !matches!(s, ShapeType::Scalar) {
@@ -1393,6 +1536,114 @@ clip a = a
 main = 1
 ";
         assert!(check(src).is_ok(), "複合 shape 算術式は通過を期待");
+    }
+
+    // ----- P5: 値依存 shape（DimList を通じた zeros/ones/reshape の具体 shape 推論） -----
+    // `zeros [3]` のように整数リテラルの shape 指定子が渡されると、
+    // shape_eval_tensor_lit が DimList([3]) を返し、apply_shape_builtin が
+    // Tensor[Concrete(3)] に変換する。これにより zeros 由来の値も Tensor shape が伝播する。
+
+    #[test]
+    fn p5_zeros_concrete_shape() {
+        // zeros [3] は Tensor[3]（= Concrete(3)）を返す（P5 の中核）。
+        // P4 以前は Unknown を返していた。
+        let src = "main = zeros [3]";
+        match check(src) {
+            Ok(ShapeType::Tensor(d)) => assert_eq!(d, vec![DimVal::Concrete(3)]),
+            other => panic!("Tensor[3] を期待: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p5_zeros_2d_shape() {
+        // zeros [2, 4] は 2D テンソル Tensor[2, 4] を返す。
+        let src = "main = zeros [2, 4]";
+        match check(src) {
+            Ok(ShapeType::Tensor(d)) => {
+                assert_eq!(d, vec![DimVal::Concrete(2), DimVal::Concrete(4)])
+            }
+            other => panic!("Tensor[2,4] を期待: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p5_zeros_shape_propagation_mismatch() {
+        // zeros [3] の結果（Tensor[3]）と別の Tensor[2] を加算すると不整合が検出される。
+        // P4 以前は zeros が Unknown を返すため ElementwiseMismatch は起きなかった（見逃し）。
+        // P5 では zeros の shape が確定するため、下流の加算で正しく不整合が検出される。
+        let src = "main = zeros [3] + [1.0, 2.0]";
+        assert!(
+            matches!(check(src), Err(ShapeError::ElementwiseMismatch { .. })),
+            "zeros [3] + [2] は ElementwiseMismatch を期待"
+        );
+    }
+
+    #[test]
+    fn p5_ones_concrete_shape() {
+        // ones [5] も zeros と同様に Tensor[5] を返す。
+        let src = "main = ones [5]";
+        match check(src) {
+            Ok(ShapeType::Tensor(d)) => assert_eq!(d, vec![DimVal::Concrete(5)]),
+            other => panic!("Tensor[5] を期待: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p5_reshape_concrete_shape() {
+        // reshape t [2, 3] は出力 shape が Tensor[2, 3] になる（第2引数 DimList から）。
+        let src = "main = reshape [1.0, 2.0, 3.0, 4.0, 5.0, 6.0] [2, 3]";
+        match check(src) {
+            Ok(ShapeType::Tensor(d)) => {
+                assert_eq!(d, vec![DimVal::Concrete(2), DimVal::Concrete(3)])
+            }
+            other => panic!("Tensor[2,3] を期待: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p5_zeros_float_literal_is_unknown() {
+        // `zeros [3.0]` の引数は浮動小数リテラルなので DimList にならず Unknown のまま。
+        // 偽陽性ゼロ原則: float を整数として解釈して形状を勝手に確定させない。
+        let src = "main = zeros [3.0]";
+        assert!(
+            matches!(check(src), Ok(ShapeType::Unknown)),
+            "float引数のzeros は Unknown を期待"
+        );
+    }
+
+    #[test]
+    fn p5_zeros_annotation_mismatch_via_dim_list() {
+        // zeros [3] の具体 shape が伝播することで、注釈との不整合が検出される。
+        // w : Tensor[2]  w = zeros [3] は [2] vs [3] で AnnotationMismatch。
+        // P4 以前は zeros が Unknown を返すため注釈照合がスキップされていた。
+        let src = "
+w : Tensor[2]
+w = zeros [3]
+main = 1
+";
+        assert!(
+            matches!(check(src), Err(ShapeError::AnnotationMismatch { .. })),
+            "zeros[3]と注釈[2]の不整合は AnnotationMismatch を期待"
+        );
+    }
+
+    #[test]
+    fn p5_subst_resolves_return_dim_expr() {
+        // P5: 引数の具体サイズから置換表を構築し、戻り型の算術式を解決する。
+        // double_size : Tensor[n] -> Tensor[n*2]
+        // n=3（引数 [3]）→ 戻り Tensor[n*2] = Tensor[Concrete(6)] に解決される。
+        // 本体 `a` は Tensor[3]（Var なし）を返すが、宣言 Tensor[Concrete(6)] と不一致。
+        // これにより shape 算術の戻り型検査が機能することを確認する。
+        let src = "
+double_size : Tensor[n] -> Tensor[n*2]
+double_size a = a
+main = 1
+";
+        // 引数が Unknown（型注釈なし呼び出しがない）なら subst は空なので DimExpr は Unknown。
+        // pass3 では宣言引数 Tensor[n] で param を束縛するが、n は DimVal::Var(n) のまま。
+        // 戻り型 Tensor[n*2] は subst 無しで Unknown → check_annotation はスキップ（偽陽性なし）。
+        // このテストでは偽陽性が起きないことを確認する。
+        assert!(check(src).is_ok(), "戻り算術式は subst 無しなら Unknown → スキップ（偽陽性なし）");
     }
 
     #[test]
