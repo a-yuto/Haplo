@@ -118,10 +118,34 @@ pub enum TypeExpr {
 
 // テンソル型注釈の 1 次元ぶん。型式専用（実行時の `DimVal` とは別レイヤ）。
 //   Fixed(n) … 固定サイズ（例: `Tensor[3]`）。P3 の検査対象。
-//   Var(name) … 次元変数（例: `Tensor[n]`）。P3 では保持・伝播のみ、単一化は P4。
-// shape staging パスで `DimVal::{Concrete,Var}` に対応づける（shape_of_type）。
+//   Var(name) … 次元変数（例: `Tensor[n]`）。P3 では保持・伝播のみ、P4 で単一化。
+//   Expr(e)   … shape 算術式（例: `Tensor[m+n]`）。P4 で AST に追加。
+//              検査は concat/flatten 等のプリミティブ追加後（P6 目標）に対応予定。
+//              現在は保持のみで評価は Unknown にフォールバックして偽陽性を生まない。
+// shape staging パスで `DimVal::{Concrete,Var,Unknown}` に対応づける（shape_of_type）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeDim {
     Fixed(usize),
     Var(String),
+    // shape 算術式（P4 新規）。型注釈中でのみ使用。
+    Expr(DimExpr),
+}
+
+// 型注釈の次元位置に書ける算術式（P4 新規）。
+// 評価器・staging パスでは concat/flatten 等のプリミティブが揃う P6 以降に対応し、
+// 現状は AST として保持・伝播するだけで shape_of_type は Unknown を返す。
+// 代替: DimExpr を TypeDim::Var に含める（例: "m+n" をまとめて1変数名扱い）案もあったが、
+//      算術の構造を失って P6 の評価追加が困難になるため、専用の再帰 AST を選んだ。
+#[derive(Debug, Clone, PartialEq)]
+pub enum DimExpr {
+    // 整数リテラル（例: `1`, `256`）
+    Lit(usize),
+    // 次元変数（例: `m`, `n`）
+    Var(String),
+    // 加算（例: `m+n`）
+    Add(Box<DimExpr>, Box<DimExpr>),
+    // 減算（例: `m-1`）
+    Sub(Box<DimExpr>, Box<DimExpr>),
+    // 乗算（例: `m*n`）
+    Mul(Box<DimExpr>, Box<DimExpr>),
 }

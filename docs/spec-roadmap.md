@@ -10,9 +10,9 @@ dependent 型は研究レベルなので段階導入する。
 | P1 | リバースモード autodiff のテープ、`grad` で勾配 | 同上 |
 | P2 ✅ | shape の抽象評価（staging パス） | 抽象 shape ドメイン |
 | P3 ✅ | shape 検査を型に導入（固定次元） | 静的 shape |
-| **P4** | **shape 多態（次元変数の単一化）＋ shape 算術** | **多相 shape** |
-| P5 | 完全な dependent 型（値依存の shape） | dependent |
-| P6 | レイアウトの厳密化・エラー改善・標準ライブラリ | — |
+| **P4 ✅** | **shape 多態（次元変数の単一化）＋ shape 算術** | **多相 shape** |
+| **P5 ✅** | **値依存 shape（DimList・zeros/ones/reshape の具体 shape 推論・置換評価）** | **dependent（部分）** |
+| **P6 ✅** | **標準ライブラリ拡充（abs/max_val/min_val/concat/flatten/norm/clip）・エラー改善・concat/flatten shape 推論** | **—** |
 
 P0〜P4 で既に実用的かつ十分意欲的。P5 を最終目標に置きつつ手前で価値を出す。
 
@@ -38,6 +38,122 @@ P0〜P4 で既に実用的かつ十分意欲的。P5 を最終目標に置きつ
 
 P2 では固定次元（`Concrete` のみ）を対象とし、次元変数の単一化は P4 で導入する。
 staging pass の構造を P2 で確立することで、P4 では単一化アルゴリズムを追加するだけでよい。
+
+### P6：標準ライブラリ拡充・エラー改善・concat/flatten shape 推論の詳細 ✅ 実装済み
+
+**新組み込み関数（`value.rs` / `interpreter.rs` / `shape_stage.rs`）**
+
+| 関数 | シグネチャ（概念） | shape 規則 |
+|------|-------------------|------------|
+| `abs` | `a -> a` | 入力と同 shape |
+| `max_val` | `Tensor[...] -> f32` | スカラー（集約） |
+| `min_val` | `Tensor[...] -> f32` | スカラー（集約） |
+| `concat` | `Tensor[m] -> Tensor[n] -> Tensor[m+n]` | Concrete 時 m+n を確定 |
+| `flatten` | `Tensor[m,n] -> Tensor[m*n]` | Concrete 時 m*n を確定 |
+| `norm` | `Tensor[...] -> f32` | スカラー（L2 ノルム） |
+| `clip` | `f32 -> f32 -> Tensor[...] -> Tensor[...]` | 入力と同 shape |
+
+**shape 算術の実動作（P6 の中核）**
+
+`concat` / `flatten` の shape 規則を `apply_shape_builtin` に実装したことで、
+P4 で AST に持たせるだけだった shape 算術（`m+n`, `m*n`）が初めて実際の推論で使われるようになった:
+
+- `concat [1,2] [3,4,5]` → `Tensor[2] concat Tensor[3]` → `Tensor[5]`（2+3=5 を確定）
+- `flatten [[1,2,3],[4,5,6]]` → `Tensor[2,3]` → `Tensor[6]`（2*3=6 を確定）
+
+Concrete でない場合（Var/Unknown が絡む）は Unknown にフォールバックして偽陽性ゼロを維持する。
+
+**エラーメッセージ改善**
+
+- `HaploError::Shape` の `Display` に「ヒント」行を追加（型注釈の見直しを促す）
+- CLI エラー出力を `error[ファイル名]: ...` 形式に統一（IDE からのジャンプを想定）
+- 未使用の `all_concrete` ヘルパを削除（P4 の `dim_pair_conflict` 移行で不要になった）
+
+**サンプル追加: `examples/stdlib_showcase.hpl`**
+
+新組み込み関数 7 本の組み合わせ例。`abs → clip → norm` のパイプラインで信号を正規化する。
+
+### P5：値依存 shape（DimList・置換評価）の詳細 ✅ 実装済み
+
+**DimList による具体 shape 伝播**
+
+P4 まで `zeros`/`ones`/`reshape` は常に `Unknown` を返していた。P5 では整数リテラルのみからなる
+1D テンソル（`[3]`、`[2, 4]` など）を `ShapeType::DimList(Vec<usize>)` として認識し、
+`apply_shape_builtin` で消費して具体的な `Tensor[Concrete(...)]` を返す。
+
+- `shape_eval_tensor_lit`: 1行かつ全要素が非負整数リテラル → `DimList` を返す
+  （浮動小数 `[3.0]` は対象外。偽陽性ゼロ）
+- `apply_shape_builtin`:
+  - `Zeros | Ones`: `DimList(dims)` → `Tensor[Concrete(n) for n in dims]`
+  - `Reshape`: 第2引数が `DimList(dims)` → `Tensor[Concrete(n) for n in dims]`
+
+これにより `zeros [3]` が `Tensor[3]` に、`zeros [2, 4]` が `Tensor[2, 4]` に確定し、
+下流の演算でも shape が伝播する。例: `zeros [3] + [1,2]` が `ElementwiseMismatch` を検出できる。
+
+**shape 算術の置換評価（`Subst`）**
+
+`check_annotated_fn` で引数の宣言 `TypeDim::Var(name)` と推論 `DimVal::Concrete(n)` を
+突き合わせて置換表 `Subst = HashMap<String, usize>` を構築する。
+戻り型を `shape_of_type_with_subst` で変換する際、`TypeDim::Expr` に含まれる変数を
+`eval_dim_expr` で評価して `DimVal::Concrete` に解決する。
+
+```
+例: double_size : Tensor[n] -> Tensor[n*2]
+  引数が Tensor[Concrete(3)] → subst = {n: 3}
+  戻り型 Tensor[n*2] → eval_dim_expr(n*2, {n:3}) = 6 → Tensor[Concrete(6)]
+```
+
+`subst` に変数が無い場合（引数が Unknown/Var）は `None` を返し `DimVal::Unknown` に
+フォールバックするため、偽陽性は生じない。
+
+```
+新規追加:
+  ShapeType::DimList(Vec<usize>)   -- 整数リテラルの 1D テンソル（shape 指定子）
+  type Subst = HashMap<String, usize>
+  fn eval_dim_expr(e: &DimExpr, subst: &Subst) -> Option<usize>
+  fn shape_of_type_with_subst(ty: &TypeExpr, subst: &Subst) -> ShapeType
+  fn build_subst_from_params(param_shapes: &[ShapeType], declared_arrow: &TypeExpr) -> Subst
+```
+
+### P4：次元変数の単一化・shape 算術の詳細 ✅ 実装済み
+
+P3 では次元変数（`Var`）を保持・伝播するだけで単一化はしなかった。P4 では以下を実装した：
+
+**次元変数の単一化（`VarConflict` 検出）**
+
+- 同名変数（例: `Tensor[n] + Tensor[n]`）→ 一致が保証される。P4 では `elementwise_shape` が
+  `dim_pair_conflict` を使い、同名変数を正しく「等しい次元」として扱い `Tensor[n]` を返す
+  （P3 では all_concrete が None のため Unknown を返していた）。
+- 異名変数（例: `Tensor[n] + Tensor[m]`）→ 独立した型変数なので等しい保証がない。
+  `VarConflict` エラーを報告する。同様に行列積の内次元が異名変数の場合も `VarConflict`。
+- ランク不一致（例: `Tensor[n] + Tensor[n, m]`）→ 変数を含む場合でも常に `ElementwiseMismatch`。
+
+`check_annotation` も P4 で拡張した：ランク不一致・宣言 Var 名と推論 Var 名の不一致も
+`AnnotationMismatch` として報告する（P3 は完全 Concrete 同士のみ）。
+
+**`->` の結合規則修正**
+
+型式パーサの `parse_type_expr` が左結合で `->` をパースしていたため、
+`A -> B -> C` が `Arrow(Arrow(A,B), C)` になっており、多引数注釈で先頭の引数が
+`Arrow(A,B)` 全体になって `shape_of_type` が `Unknown` を返す潜在バグがあった。
+P4 で右結合（再帰 `parse_type_expr`）に修正し、`A -> (B -> C)` として正しく
+`decompose_arrow` で個別引数 shape に剥がせるようにした。
+
+**shape 算術（`TypeDim::Expr`）**
+
+型注釈中に `m+n`, `m*n`, `m+n-1` 等の算術式を書けるようにした。
+- AST: `TypeDim::Expr(DimExpr)` 追加。`DimExpr = Lit | Var | Add | Sub | Mul`。
+- パーサ: `parse_dim_expr` / `parse_dim_term` / `parse_dim_atom` で Tensor 次元をパース。
+  優先順位: `*` > `+/-`（標準算術と同じ）。
+- `shape_of_type` では算術式を `DimVal::Unknown` に変換（偽陽性ゼロ）。
+  `concat/flatten` 等プリミティブの追加後（P6 目標）に実際の評価を実装予定。
+
+```
+エラー種別（P4 で追加/拡張）:
+  VarConflict { op, var_a, var_b }  -- 異名変数が要素ごと演算/行列積内次元で衝突
+  ElementwiseMismatch               -- ランク不一致でも報告（Var を含む場合も）
+  AnnotationMismatch                -- ランク不一致・Var 名不一致も対象に拡張
+```
 
 ### P3：型注釈駆動の shape 検査（固定次元）の詳細 ✅ 実装済み
 

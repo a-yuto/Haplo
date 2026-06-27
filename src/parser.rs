@@ -164,17 +164,85 @@ impl<'a> Parser<'a> {
     }
 
     // ----------------------------------------------------------------
-    // 型式
+    // 型式 / 次元式（P4 shape 算術）
     // ----------------------------------------------------------------
 
-    fn parse_type_expr(&mut self) -> Result<TypeExpr, ParseError> {
-        let mut t = self.parse_type_atom()?;
-        while matches!(self.peek(), TokenKind::Arrow) {
-            self.advance();
-            let rhs = self.parse_type_atom()?;
-            t = TypeExpr::Arrow(Box::new(t), Box::new(rhs));
+    // テンソル型注釈の次元位置に書ける算術式をパースする（P4 新規）。
+    // 文法: dim_expr = dim_term (('+' | '-') dim_term)*
+    // 例: `m+n`, `m-1`, `m+n-1`
+    // ',' や ']' は dim_expr の終端として扱われ、parse_dim_expr がそこで止まる。
+    fn parse_dim_expr(&mut self) -> Result<DimExpr, ParseError> {
+        let mut lhs = self.parse_dim_term()?;
+        loop {
+            match self.peek().clone() {
+                TokenKind::Plus => {
+                    self.advance();
+                    let rhs = self.parse_dim_term()?;
+                    lhs = DimExpr::Add(Box::new(lhs), Box::new(rhs));
+                }
+                TokenKind::Minus => {
+                    self.advance();
+                    let rhs = self.parse_dim_term()?;
+                    lhs = DimExpr::Sub(Box::new(lhs), Box::new(rhs));
+                }
+                _ => break,
+            }
         }
-        Ok(t)
+        Ok(lhs)
+    }
+
+    // 次元式の乗算レベル: dim_term = dim_atom ('*' dim_atom)*
+    fn parse_dim_term(&mut self) -> Result<DimExpr, ParseError> {
+        let mut lhs = self.parse_dim_atom()?;
+        loop {
+            if matches!(self.peek(), TokenKind::Star) {
+                self.advance();
+                let rhs = self.parse_dim_atom()?;
+                lhs = DimExpr::Mul(Box::new(lhs), Box::new(rhs));
+            } else {
+                break;
+            }
+        }
+        Ok(lhs)
+    }
+
+    // 次元式の原子: 整数リテラルまたは次元変数名
+    fn parse_dim_atom(&mut self) -> Result<DimExpr, ParseError> {
+        match self.peek().clone() {
+            TokenKind::Int(n) => {
+                self.advance();
+                Ok(DimExpr::Lit(n as usize))
+            }
+            TokenKind::Ident(var) => {
+                self.advance();
+                Ok(DimExpr::Var(var))
+            }
+            _ => {
+                let tok = self.peek_token();
+                Err(ParseError::UnexpectedToken {
+                    got: format!("{:?}", tok.kind),
+                    expected: "次元（整数または識別子）",
+                    span: tok.span.clone(),
+                })
+            }
+        }
+    }
+
+    // `->` は右結合: `A -> B -> C` = `A -> (B -> C)` = Arrow(A, Arrow(B, C))。
+    // 左結合（while ループ）にすると `Arrow(Arrow(A,B), C)` になり、
+    // decompose_arrow が先頭 Arrow の lhs（= Arrow(A,B)）を「1つ目の引数型」として
+    // shape_of_type に渡してしまい、複数引数の型注釈が機能しなくなる。
+    // 右結合（再帰呼び出し）なら decompose_arrow がネストを正しく順番に剥がせる。
+    fn parse_type_expr(&mut self) -> Result<TypeExpr, ParseError> {
+        let t = self.parse_type_atom()?;
+        if matches!(self.peek(), TokenKind::Arrow) {
+            self.advance();
+            // 再帰で右辺を右結合にパース（`A -> B -> C` = `A -> (B -> C)`）。
+            let rhs = self.parse_type_expr()?;
+            Ok(TypeExpr::Arrow(Box::new(t), Box::new(rhs)))
+        } else {
+            Ok(t)
+        }
     }
 
     fn parse_type_atom(&mut self) -> Result<TypeExpr, ParseError> {
@@ -189,17 +257,16 @@ impl<'a> Parser<'a> {
                     self.advance(); // consume `[`
                     let mut dims = Vec::new();
                     loop {
-                        match self.peek().clone() {
-                            TokenKind::Int(n) => {
-                                dims.push(TypeDim::Fixed(n as usize));
-                                self.advance();
-                            }
-                            TokenKind::Ident(var) => {
-                                dims.push(TypeDim::Var(var)); // 次元変数（名前を保持）
-                                self.advance();
-                            }
-                            _ => {}
-                        }
+                        // P4: 次元に算術式（m+n, m*n 等）を許可する。
+                        // parse_dim_expr で DimExpr を組み立て、単純な Lit/Var は
+                        // TypeDim::Fixed/Var に、複合式は TypeDim::Expr に畳む。
+                        let expr = self.parse_dim_expr()?;
+                        let dim = match expr {
+                            DimExpr::Lit(n) => TypeDim::Fixed(n),
+                            DimExpr::Var(s) => TypeDim::Var(s),
+                            e => TypeDim::Expr(e),
+                        };
+                        dims.push(dim);
                         match self.peek() {
                             TokenKind::Comma => {
                                 self.advance();

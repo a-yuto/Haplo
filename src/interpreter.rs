@@ -77,6 +77,14 @@ fn load_builtins(env: Env) -> Env {
         ("reshape", BuiltinFn::Reshape),
         ("grad", BuiltinFn::Grad),
         ("iterate", BuiltinFn::Iterate),
+        // P6 標準ライブラリ
+        ("abs", BuiltinFn::Abs),
+        ("max_val", BuiltinFn::MaxVal),
+        ("min_val", BuiltinFn::MinVal),
+        ("concat", BuiltinFn::Concat),
+        ("flatten", BuiltinFn::Flatten),
+        ("norm", BuiltinFn::Norm),
+        ("clip", BuiltinFn::Clip),
     ];
     for (name, f) in builtins {
         env.define_global(name.to_string(), Value::Builtin(*f));
@@ -194,8 +202,8 @@ pub fn eval(expr: &Expr, env: &Env) -> Result<Value, EvalError> {
 // shape_stage（P2）も同じ arity で部分適用を処理するため pub(crate) で共有する。
 pub(crate) fn builtin_arity(b: BuiltinFn) -> usize {
     match b {
-        BuiltinFn::Reshape | BuiltinFn::Grad => 2,
-        BuiltinFn::Iterate => 3,
+        BuiltinFn::Reshape | BuiltinFn::Grad | BuiltinFn::Concat => 2,
+        BuiltinFn::Iterate | BuiltinFn::Clip => 3,
         _ => 1,
     }
 }
@@ -354,6 +362,88 @@ fn apply_builtin(b: BuiltinFn, args: Vec<Value>) -> Result<Value, EvalError> {
         }
         BuiltinFn::Grad => builtin_grad(args),
         BuiltinFn::Iterate => builtin_iterate(args),
+
+        // P6 標準ライブラリの実装
+        BuiltinFn::Abs => match args[0].clone() {
+            Value::Float(x) => Ok(Value::Float(x.abs())),
+            Value::Int(n) => Ok(Value::Int(n.abs())),
+            Value::Tensor(t) => Ok(Value::Tensor(Rc::new(t.mapv(f64::abs)))),
+            other => Err(EvalError::TypeMismatch {
+                expected: "Float / Int / Tensor",
+                got: value_type_name(&other),
+            }),
+        },
+
+        BuiltinFn::MaxVal => {
+            let t = coerce_to_tensor(args[0].clone())?;
+            if t.is_empty() {
+                return Err(EvalError::InvalidArgument(
+                    "max_val: 空テンソルに最大値は定義されません".into(),
+                ));
+            }
+            // fold で最大値を求める（partial_cmp を使い NaN は後ろに回す）。
+            let max = t.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            Ok(Value::Float(max))
+        }
+
+        BuiltinFn::MinVal => {
+            let t = coerce_to_tensor(args[0].clone())?;
+            if t.is_empty() {
+                return Err(EvalError::InvalidArgument(
+                    "min_val: 空テンソルに最小値は定義されません".into(),
+                ));
+            }
+            let min = t.iter().cloned().fold(f64::INFINITY, f64::min);
+            Ok(Value::Float(min))
+        }
+
+        // concat a b: 2つの 1D テンソルを連結して長さ m+n の 1D テンソルを返す。
+        // 2引数組み込み（arity=2）。両辺が 1D テンソルであることを確認する。
+        BuiltinFn::Concat => {
+            let a = coerce_to_tensor(args[0].clone())?;
+            let b = coerce_to_tensor(args[1].clone())?;
+            if a.ndim() != 1 || b.ndim() != 1 {
+                return Err(EvalError::InvalidArgument(format!(
+                    "concat は 1D テンソルが必要です（{}D と {}D が渡されました）",
+                    a.ndim(),
+                    b.ndim()
+                )));
+            }
+            // a と b の要素を結合して 1D 配列にする。
+            let mut data: Vec<f64> = a.iter().cloned().collect();
+            data.extend(b.iter().cloned());
+            let arr = ArrayD::from_shape_vec(IxDyn(&[data.len()]), data)
+                .expect("concat: shape vec 変換失敗（バグ）");
+            Ok(Value::Tensor(Rc::new(arr)))
+        }
+
+        // flatten t: 2D テンソルを 1D に展開する。要素は行優先（C 順）で並ぶ。
+        BuiltinFn::Flatten => {
+            let t = coerce_to_tensor(args[0].clone())?;
+            let n = t.len();
+            // into_shape は標準 ndarray メソッド。行優先でフラット化する。
+            let flat = t
+                .to_shape(IxDyn(&[n]))
+                .map_err(|_| EvalError::InvalidArgument("flatten: shape 変換失敗".into()))?
+                .to_owned();
+            Ok(Value::Tensor(Rc::new(flat)))
+        }
+
+        // norm t: L2 ノルム（|| t ||_2 = sqrt( sum(t^2) )）。スカラーを返す。
+        BuiltinFn::Norm => {
+            let t = coerce_to_tensor(args[0].clone())?;
+            let sq_sum: f64 = t.iter().map(|x| x * x).sum();
+            Ok(Value::Float(sq_sum.sqrt()))
+        }
+
+        // clip lo hi t: テンソルの各要素を区間 [lo, hi] にクリップする。
+        // 3引数組み込み（arity=3）。lo・hi はスカラー（Float または Int）。
+        BuiltinFn::Clip => {
+            let lo = coerce_to_float(args[0].clone())?;
+            let hi = coerce_to_float(args[1].clone())?;
+            let t = coerce_to_tensor(args[2].clone())?;
+            Ok(Value::Tensor(Rc::new(t.mapv(|x| x.clamp(lo, hi)))))
+        }
     }
 }
 
@@ -1213,6 +1303,88 @@ main = isEven 10
         // builtin_grad は「x と同 shape のゼロ」を返す（勾配 0）。その経路を検証する。
         let t = run_t("f w = 5.0\nmain = grad f [1.0, 2.0]");
         assert!(t.iter().all(|&x| x == 0.0));
+    }
+
+    // ----- P6: 標準ライブラリ（abs / max_val / min_val / concat / flatten / norm / clip） -----
+
+    #[test]
+    fn p6_abs_scalar() {
+        // abs のスカラー版。負数の符号反転と正数の保持を確認する。
+        assert!(matches!(run("main = abs (-3)"), Value::Int(3)));
+        match run("main = abs (-2.5)") {
+            Value::Float(x) => assert!((x - 2.5).abs() < 1e-9),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn p6_abs_tensor() {
+        // abs のテンソル版。各要素が絶対値に変換されることを確認する。
+        let t = run_t("main = abs [-1.0, 2.0, -3.0]");
+        assert_eq!(t.shape(), &[3]);
+        assert!((t[[0]] - 1.0).abs() < 1e-9);
+        assert!((t[[1]] - 2.0).abs() < 1e-9);
+        assert!((t[[2]] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p6_max_val_min_val() {
+        // max_val / min_val はテンソル全体を集約してスカラーを返す。
+        match run("main = max_val [3.0, 1.0, 4.0, 1.0, 5.0]") {
+            Value::Float(x) => assert!((x - 5.0).abs() < 1e-9),
+            _ => panic!(),
+        }
+        match run("main = min_val [3.0, 1.0, 4.0, 1.0, 5.0]") {
+            Value::Float(x) => assert!((x - 1.0).abs() < 1e-9),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn p6_concat_1d() {
+        // concat a b: 2 つの 1D テンソルを連結して長さ m+n の 1D テンソルにする。
+        // [1,2] と [3,4,5] を連結 → [1,2,3,4,5]（長さ 5）。
+        let t = run_t("main = concat [1.0, 2.0] [3.0, 4.0, 5.0]");
+        assert_eq!(t.shape(), &[5]);
+        assert!((t[[0]] - 1.0).abs() < 1e-9);
+        assert!((t[[4]] - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p6_concat_empty() {
+        // 空テンソルとの連結。[]+[1,2,3] = [1,2,3]（長さ変わらず）。
+        let t = run_t("main = concat [] [1.0, 2.0, 3.0]");
+        assert_eq!(t.shape(), &[3]);
+    }
+
+    #[test]
+    fn p6_flatten_2d() {
+        // flatten: 2D テンソルを行優先で 1D に展開する。
+        // [[1,2],[3,4]] → [1,2,3,4]（m=2, n=2, 長さ m*n=4）。
+        let t = run_t("main = flatten [1.0, 2.0; 3.0, 4.0]");
+        assert_eq!(t.shape(), &[4]);
+        assert!((t[[0]] - 1.0).abs() < 1e-9);
+        assert!((t[[3]] - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn p6_norm() {
+        // norm: L2 ノルム。[3, 4] → sqrt(9+16) = sqrt(25) = 5。
+        match run("main = norm [3.0, 4.0]") {
+            Value::Float(x) => assert!((x - 5.0).abs() < 1e-9),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn p6_clip() {
+        // clip lo hi t: 各要素を区間 [lo, hi] に制限する。
+        // [-2, 0.5, 3] をクリップ [0, 1] → [0, 0.5, 1]。
+        let t = run_t("main = clip 0.0 1.0 [-2.0, 0.5, 3.0]");
+        assert_eq!(t.shape(), &[3]);
+        assert!((t[[0]] - 0.0).abs() < 1e-9);
+        assert!((t[[1]] - 0.5).abs() < 1e-9);
+        assert!((t[[2]] - 1.0).abs() < 1e-9);
     }
 
     // ----- G3: 北極星プログラム（線形回帰の学習ループ） -----

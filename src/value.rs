@@ -64,6 +64,21 @@ pub enum BuiltinFn {
     Reshape,
     Grad,
     Iterate,
+    // P6 新規: 標準ライブラリ
+    // 要素ごとの絶対値（スカラー・テンソル両対応）
+    Abs,
+    // テンソル全要素の最大値（スカラー返し）
+    MaxVal,
+    // テンソル全要素の最小値（スカラー返し）
+    MinVal,
+    // 1D テンソルの連結。concat a b : Tensor[m] -> Tensor[n] -> Tensor[m+n]
+    Concat,
+    // 2D → 1D 展開。flatten t : Tensor[m,n] -> Tensor[m*n]
+    Flatten,
+    // L2 ノルム（norm t = sqrt (sum (t ^ 2))）のフュージョンされた版
+    Norm,
+    // 要素を [lo, hi] でクリップ。clip lo hi t
+    Clip,
 }
 
 // ユーザ定義関数（クロージャ）の実行時表現。
